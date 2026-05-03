@@ -4,8 +4,23 @@ SeaVault Fast is a cross-platform prototype for client-side encrypted storage. I
 
 This repository is a working MVP, not an audited production replacement for Cryptomator.
 
-## What changed in v0.4
+## What changed in v0.7
 
+- Reworked the GUI into a responsive two-column desktop layout with the result/progress panel on the right.
+- Added tablet and phone breakpoints, full-width controls, horizontally scrollable tables, and cross-browser colour/focus fallbacks.
+- Added browser capability messaging for folder upload and core browser APIs.
+- Added a GUI responsive-layout test and documentation in `docs/gui-responsive-layout.md`.
+
+## What changed in v0.6
+
+- Fixed large browser folder upload reliability by sending selected files in smaller batches with progress and cancel support.
+- Added GUI bulk export for selected virtual folders/files and the entire vault.
+- Added export dry-run counts, overwrite policy, local destination folder support, and optional ZIP export.
+- Added `seavault export` for CLI bulk export with dry-run, ZIP, and overwrite controls.
+- Moved the main GUI result/progress window to a right-side panel with clearer human-readable messages.
+- Added GUI and API rsync status checks.
+- Added rsync-assisted archive ingest for CLI `put` and GUI local path uploads.
+- Added browser folder upload support in the GUI.
 - Added rclone as the primary remote transport backend.
 - Added an app-managed rclone runtime; users do not need system rclone.
 - Added CLI commands for rclone runtime status, install, update, rollback, path, version, and verification.
@@ -22,12 +37,57 @@ The vault path is the encrypted local storage location. Put it inside a folder w
 
 ```bash
 seavault init --profile nextcloud "~/Nextcloud/seavault"
-seavault put nextcloud ./report.pdf reports/report.pdf
+seavault put --method auto nextcloud ./report.pdf reports/report.pdf
+seavault put --method rsync nextcloud ./project-folder projects/project-folder
 seavault list nextcloud
 seavault get nextcloud reports/report.pdf ./recovered/report.pdf
+seavault export nextcloud . ~/Desktop/seavault-export
 ```
 
 The provider sees only `.seavault/vault.json`, encrypted chunk objects, encrypted manifests, and tombstones. Plaintext files stay outside the vault unless explicitly exported/downloaded.
+
+## Rsync-assisted archive ingest
+
+The `put` command now defaults to `--method auto`, which prefers rsync when rsync is available on the machine and falls back to native ingest when rsync is missing. Use `--method rsync` when rsync must be required, or `--method native` to bypass rsync staging.
+
+```bash
+# Prefer rsync, fall back to native only when rsync is missing
+seavault put --method auto nextcloud ./folder archive/folder
+
+# Require rsync
+seavault put --method rsync nextcloud ./folder archive/folder
+
+# Override rsync binary path
+seavault put --method rsync --rsync /usr/bin/rsync nextcloud ./folder archive/folder
+```
+
+Rsync is used only as a local staging/enumeration helper for ingest. It does not write plaintext into `.seavault`; the app encrypts staged files into content-defined chunks and encrypted manifests. The temporary staging directory is deleted after ingest unless debugging options are added in development builds.
+
+The GUI now has two folder options:
+
+- Browser folder upload, using the browser-provided relative file paths where supported.
+- Local path upload, where the local GUI server reads a file or folder path from this computer and uses rsync-assisted ingest.
+
+
+## Bulk export
+
+The CLI and GUI can export a virtual folder, a single virtual file, or the entire vault. Export decrypts plaintext to a destination you choose, so do not export into `.seavault`.
+
+```bash
+# Plan an export without writing plaintext
+seavault export --dry-run nextcloud . ~/Desktop/seavault-export
+
+# Export the entire vault
+seavault export nextcloud . ~/Desktop/seavault-export
+
+# Export one virtual folder
+seavault export --overwrite skip nextcloud projects/site ~/Desktop/site-export
+
+# Export one virtual folder as ZIP
+seavault export --zip nextcloud projects/site ~/Desktop
+```
+
+Overwrite policies are `fail`, `skip`, and `replace`. The GUI exposes the same controls with progress and cancel support.
 
 ## Rclone transport model
 
@@ -97,7 +157,9 @@ Remote profile configuration is stored outside the vault. Rclone config is store
 seavault gui
 ```
 
-The GUI listens on `127.0.0.1:8787` by default. It provides vault create/open/upload/download/delete/verify workflows, profile management, managed rclone runtime controls, remote repository profiles, transfer actions, and SSH key management.
+The GUI listens on `127.0.0.1:8787` by default. It provides vault create/open/upload/download/delete/verify workflows, batched browser folder upload, rsync-assisted local path ingest, bulk export, optional ZIP export, profile management, managed rclone runtime controls, remote repository profiles, transfer actions, and SSH key management.
+
+The desktop layout keeps the result/progress panel on the right. Narrower tablet and phone layouts collapse to one column so controls remain readable and tables do not force horizontal page scrolling. Browser folder upload is capability-detected; when a browser does not expose folder selection, use local path ingest for directory imports.
 
 Do not bind the GUI to a public or shared network interface.
 
@@ -105,8 +167,10 @@ Do not bind the GUI to a public or shared network interface.
 
 ```bash
 seavault init [flags] VAULT_DIR
-seavault put [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
+seavault put [--method auto|rsync|native] [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
 seavault get [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_PATH
+seavault export [--overwrite fail|skip|replace] [--zip] [--dry-run] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_LOCAL_FOLDER_OR_ZIP
+seavault rsync status [--binary PATH]
 seavault list [flags] VAULT_DIR_OR_PROFILE
 seavault remove [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH
 seavault verify [flags] VAULT_DIR_OR_PROFILE
@@ -140,7 +204,10 @@ go vet ./...
 go build -o bin/seavault ./cmd/seavault
 ./scripts/smoke-test.sh ./bin/seavault
 ./scripts/gui-api-smoke-test.sh ./bin/seavault
+./scripts/rsync-put-smoke-test.sh ./bin/seavault
 ```
+
+GUI layout checks are covered by `go test ./internal/webui`. See `docs/gui-responsive-layout.md` for the static responsive-layout validation checklist and optional browser-render checks.
 
 Cross-compile examples:
 
@@ -157,6 +224,7 @@ GOOS=windows GOARCH=amd64 go build -o dist/seavault-windows-amd64.exe ./cmd/seav
 - Linux keychain support requires a Secret Service provider and `secret-tool`.
 - GPG signature verification for rclone downloads depends on a locally available `gpg` binary.
 - SSH key passphrase storage, host-key pinning UI, and SSH-agent GUI integration are still production-hardening items.
+- Rsync-assisted ingest requires rsync for strict `--method rsync`; `--method auto` falls back to native ingest when rsync is missing.
 - Native mount integrations are not included; `serve` provides a minimal WebDAV-compatible local endpoint.
 - Multi-device concurrent edits are preserved as conflict copies, but the app does not merge application-level document contents.
 - Password rotation, recovery keys, signed release pipelines, installer packages, and full admin policy enforcement are still future work.
@@ -164,23 +232,3 @@ GOOS=windows GOARCH=amd64 go build -o dist/seavault-windows-amd64.exe ./cmd/seav
 ## Security boundary
 
 SeaVault protects file contents and virtual paths before the vault is synchronized. It does not hide total vault size, approximate object count, object churn, sync timing, or the existence of the vault from the cloud provider.
-
-## Rsync-backed archive ingestion
-
-`seavault put` now stages local files or folders with rsync before chunking and encrypting them into the vault when rsync is available. This gives a stable local mirror for large folder imports while keeping the encrypted vault layout unchanged.
-
-```bash
-seavault rsync status
-seavault put --ingest rsync ~/Nextcloud/seavault ./project-folder projects/project-folder
-seavault put --ingest auto ~/Nextcloud/seavault ./report.pdf reports/report.pdf
-```
-
-Ingest modes:
-
-| Mode | Behaviour |
-|---|---|
-| `auto` | Use rsync when available, otherwise use direct ingestion fallback. |
-| `rsync` | Require rsync and fail if unavailable. |
-| `direct` | Bypass rsync. |
-
-Use `SEAVAULT_RSYNC` or `--rsync-bin` to point at a specific rsync executable. The GUI Upload panel includes the same method selector and supports browser folder upload with relative path preservation. On Windows, `auto` mode falls back to direct ingestion unless a compatible rsync binary is available. Rsync is only used for local plaintext staging before encryption; remote cloud transport remains rclone-based.

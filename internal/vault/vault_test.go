@@ -238,3 +238,103 @@ func copyFile(t *testing.T, src, dst string) {
 		t.Fatal(err)
 	}
 }
+
+func TestExportPathDirectoryAllAndZip(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	password := "password"
+	createTestVault(t, root, password)
+	v, err := Open(root, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.PutReader(strings.NewReader("alpha"), "projects/site/a.txt", 5, 0o600, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.PutReader(strings.NewReader("beta"), "projects/site/nested/b.txt", 4, 0o600, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.PutReader(strings.NewReader("gamma"), "reports/q1.txt", 5, 0o600, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	dryDest := filepath.Join(t.TempDir(), "dry")
+	dry, err := v.ExportPath(nil, "projects/site", dryDest, ExportOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Files != 2 || dry.Bytes != 9 {
+		t.Fatalf("unexpected dry run: %#v", dry)
+	}
+	if _, err := os.Stat(dryDest); !os.IsNotExist(err) {
+		t.Fatalf("dry run should not create destination, stat err=%v", err)
+	}
+
+	exportDest := filepath.Join(t.TempDir(), "export")
+	res, err := v.ExportPath(nil, "projects/site", exportDest, ExportOptions{Overwrite: OverwriteFail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Exported != 2 {
+		t.Fatalf("expected 2 exported files, got %#v", res)
+	}
+	assertFileString(t, filepath.Join(exportDest, "a.txt"), "alpha")
+	assertFileString(t, filepath.Join(exportDest, "nested", "b.txt"), "beta")
+
+	allDest := filepath.Join(t.TempDir(), "all")
+	all, err := v.ExportPath(nil, ".", allDest, ExportOptions{Overwrite: OverwriteFail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all.Exported != 3 {
+		t.Fatalf("expected 3 exported files, got %#v", all)
+	}
+	assertFileString(t, filepath.Join(allDest, "reports", "q1.txt"), "gamma")
+
+	zipDir := t.TempDir()
+	zipRes, err := v.ExportPath(nil, "projects/site", zipDir, ExportOptions{Zip: true, Overwrite: OverwriteFail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zipRes.Exported != 2 || !strings.HasSuffix(zipRes.DestPath, "site.zip") {
+		t.Fatalf("unexpected zip result: %#v", zipRes)
+	}
+	if _, err := os.Stat(zipRes.DestPath); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExportOverwriteSkip(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	password := "password"
+	createTestVault(t, root, password)
+	v, err := Open(root, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.PutReader(strings.NewReader("new"), "docs/a.txt", 3, 0o600, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dest, "a.txt"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := v.ExportPath(nil, "docs", dest, ExportOptions{Overwrite: OverwriteSkip})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Skipped != 1 || res.Exported != 0 {
+		t.Fatalf("unexpected skip result: %#v", res)
+	}
+	assertFileString(t, filepath.Join(dest, "a.txt"), "old")
+}
+
+func assertFileString(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("%s = %q, want %q", path, string(got), want)
+	}
+}

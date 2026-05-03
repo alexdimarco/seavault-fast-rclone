@@ -19,7 +19,7 @@ import (
 	"github.com/example/seavault-fast/internal/profile"
 	"github.com/example/seavault-fast/internal/rclonebin"
 	"github.com/example/seavault-fast/internal/remotes"
-	"github.com/example/seavault-fast/internal/rsyncingest"
+	"github.com/example/seavault-fast/internal/rsyncput"
 	"github.com/example/seavault-fast/internal/sshkeys"
 	"github.com/example/seavault-fast/internal/transport"
 	localtransport "github.com/example/seavault-fast/internal/transport/local"
@@ -29,7 +29,7 @@ import (
 	"github.com/example/seavault-fast/internal/webui"
 )
 
-const version = "0.5.0"
+const version = "0.7.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -45,6 +45,8 @@ func main() {
 		err = cmdPut(os.Args[2:])
 	case "get":
 		err = cmdGet(os.Args[2:])
+	case "export":
+		err = cmdExport(os.Args[2:])
 	case "list":
 		err = cmdList(os.Args[2:])
 	case "remove", "rm":
@@ -153,13 +155,13 @@ func cmdInit(args []string) error {
 func cmdPut(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ExitOnError)
 	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
-	ingestMode := fs.String("ingest", "auto", "ingestion method: auto, rsync, or direct")
-	rsyncBin := fs.String("rsync-bin", "", "optional rsync binary path; default SEAVAULT_RSYNC or PATH")
+	method := fs.String("method", "auto", "put method: auto, rsync, or native; auto prefers rsync when available")
+	rsyncBinary := fs.String("rsync", "", "rsync binary path or name; default searches PATH")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 2 || fs.NArg() > 3 {
-		return fmt.Errorf("usage: seavault put [--no-keychain] [--ingest auto|rsync|direct] [--rsync-bin PATH] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
+		return fmt.Errorf("usage: seavault put [--no-keychain] [--method auto|rsync|native] [--rsync PATH] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
 	}
 	vaultPath, err := resolveVaultArg(fs.Arg(0))
 	if err != nil {
@@ -177,24 +179,19 @@ func cmdPut(args []string) error {
 	if fs.NArg() == 3 {
 		virtual = fs.Arg(2)
 	}
-	result, err := rsyncingest.PutPath(context.Background(), v, fs.Arg(1), virtual, rsyncingest.Options{Mode: *ingestMode, RsyncPath: *rsyncBin, PreserveRootOnEmpty: true})
+	res, err := rsyncput.PutPath(context.Background(), v, fs.Arg(1), virtual, rsyncput.Options{Method: *method, RsyncBinary: *rsyncBinary})
 	if err != nil {
 		return err
 	}
-	if result.Report.Warning != "" {
-		fmt.Fprintln(os.Stderr, "warning:", result.Report.Warning)
+	fmt.Printf("put method: %s\n", res.Method)
+	if res.Method == rsyncput.MethodRsync && res.RsyncBinary != "" {
+		fmt.Printf("rsync binary: %s\n", res.RsyncBinary)
 	}
-	if result.Report.UsedRsync {
-		fmt.Fprintf(os.Stderr, "ingest: rsync staged source using %s\n", result.Report.RsyncPath)
-	} else {
-		fmt.Fprintf(os.Stderr, "ingest: %s\n", result.Report.Mode)
-	}
-	for _, r := range result.Results {
+	for _, r := range res.Results {
 		fmt.Printf("put %-50s %10d bytes %4d chunks %4d new\n", r.Path, r.Size, r.ChunkCount, r.NewChunkCount)
 	}
 	return nil
 }
-
 func cmdGet(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
 	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
@@ -220,6 +217,46 @@ func cmdGet(args []string) error {
 		return err
 	}
 	fmt.Printf("restored %s to %s\n", fs.Arg(1), fs.Arg(2))
+	return nil
+}
+
+func cmdExport(args []string) error {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	overwrite := fs.String("overwrite", vault.OverwriteFail, "overwrite policy: fail, skip, or replace")
+	zipOut := fs.Bool("zip", false, "export to a ZIP archive")
+	dryRun := fs.Bool("dry-run", false, "count files and planned destinations without writing plaintext output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 3 {
+		return fmt.Errorf("usage: seavault export [--overwrite fail|skip|replace] [--zip] [--dry-run] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_LOCAL_FOLDER_OR_ZIP")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	dest, err := userpath.Abs(fs.Arg(2))
+	if err != nil {
+		return err
+	}
+	res, err := v.ExportPath(context.Background(), fs.Arg(1), dest, vault.ExportOptions{Overwrite: *overwrite, Zip: *zipOut, DryRun: *dryRun})
+	if err != nil {
+		return err
+	}
+	if *dryRun {
+		fmt.Printf("dry run: %d file(s), %d bytes, destination %s\n", res.Files, res.Bytes, res.DestPath)
+	} else {
+		fmt.Printf("exported %d file(s), skipped %d, %d bytes to %s\n", res.Exported, res.Skipped, res.Bytes, res.DestPath)
+	}
 	return nil
 }
 
@@ -529,19 +566,16 @@ func cmdKeychain(args []string) error {
 
 func cmdRsync(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: seavault rsync status [--rsync-bin PATH]")
+		return fmt.Errorf("usage: seavault rsync status [--binary PATH]")
 	}
 	switch args[0] {
-	case "status", "version":
+	case "status":
 		fs := flag.NewFlagSet("rsync status", flag.ExitOnError)
-		rsyncBin := fs.String("rsync-bin", "", "optional rsync binary path; default SEAVAULT_RSYNC or PATH")
+		binary := fs.String("binary", "", "rsync binary path or name; default searches PATH")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if fs.NArg() != 0 {
-			return fmt.Errorf("usage: seavault rsync status [--rsync-bin PATH]")
-		}
-		return printJSON(rsyncingest.Status(*rsyncBin))
+		return printJSON(rsyncput.Inspect(context.Background(), *binary))
 	default:
 		return fmt.Errorf("unknown rsync command %q", args[0])
 	}
@@ -991,9 +1025,9 @@ Cloud-folder client-side encrypted storage.
 
 Usage:
   seavault init [flags] VAULT_DIR
-  seavault put [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
-  seavault rsync status [--rsync-bin PATH]
+  seavault put [--method auto|rsync|native] [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
   seavault get [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_PATH
+  seavault export [--overwrite fail|skip|replace] [--zip] [--dry-run] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_LOCAL_FOLDER_OR_ZIP
   seavault list [flags] VAULT_DIR_OR_PROFILE
   seavault remove [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH
   seavault verify [flags] VAULT_DIR_OR_PROFILE
@@ -1008,7 +1042,7 @@ Usage:
   seavault keychain status VAULT_DIR_OR_PROFILE
   seavault keychain delete VAULT_DIR_OR_PROFILE
   seavault rclone status | install | check-update | update | rollback | verify-runtime
-  seavault rsync status
+  seavault rsync status [--binary PATH]
   seavault remote add NAME VAULT_DIR_OR_PROFILE RCLONE_REMOTE_PATH
   seavault remote list | show NAME | test NAME | dry-run NAME | push NAME | pull NAME | check NAME
   seavault ssh-key generate NAME | list | public NAME | import NAME PRIVATE_KEY

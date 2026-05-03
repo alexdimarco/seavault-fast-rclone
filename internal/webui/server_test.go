@@ -3,11 +3,11 @@ package webui
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -39,6 +39,40 @@ func getJSON(t *testing.T, s *Server, path string, dst any) int {
 		}
 	}
 	return rr.Code
+}
+
+func TestIndexUsesResponsiveCrossBrowserLayout(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("index failed: %d", rr.Code)
+	}
+	html := rr.Body.String()
+	checks := []string{
+		`<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">`,
+		`class="app-shell"`,
+		`class="result-panel"`,
+		`aria-live="polite"`,
+		`grid-template-columns: minmax(0, 1fr) minmax(340px, 420px)`,
+		`@media (max-width: 1180px)`,
+		`@media (max-width: 720px)`,
+		`* { box-sizing: border-box; }`,
+		`input, select, textarea { width: 100%;`,
+		`class="table-wrap"`,
+		`id="compatWarning"`,
+		`webkitdirectory directory multiple`,
+		`The browser could not reach the local SeaVault GUI service`,
+	}
+	for _, want := range checks {
+		if !strings.Contains(html, want) {
+			t.Fatalf("responsive GUI markup missing %q", want)
+		}
+	}
 }
 
 func TestInitCreatesAndOpensVault(t *testing.T) {
@@ -153,6 +187,102 @@ func TestInitRejectsSlashUserPathBeforeMkdir(t *testing.T) {
 	}
 }
 
+func initOpenTestVault(t *testing.T, s *Server) string {
+	t.Helper()
+	vaultPath := filepath.Join(t.TempDir(), "cloud", "seavault")
+	rr := postJSON(t, s, "/api/init", map[string]any{
+		"vaultPath": vaultPath,
+		"password":  "passphrase",
+		"kdf":       "scrypt",
+		"scryptN":   16,
+		"scryptR":   1,
+		"scryptP":   1,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("init failed: %d %s", rr.Code, rr.Body.String())
+	}
+	return vaultPath
+}
+
+func TestBrowserFolderUploadPreservesRelativePaths(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initOpenTestVault(t, s)
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	if err := mw.WriteField("path", "browser-root"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.WriteField("relpaths", "folder/nested/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := mw.CreateFormFile("files", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("folder upload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-SeaVault-Token", s.token)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upload failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var files struct {
+		Files []fileDTO `json:"files"`
+	}
+	if code := getJSON(t, s, "/api/files", &files); code != http.StatusOK {
+		t.Fatalf("files failed: %d", code)
+	}
+	if len(files.Files) != 1 || files.Files[0].Path != "browser-root/folder/nested/a.txt" {
+		t.Fatalf("unexpected files: %#v", files.Files)
+	}
+}
+
+func TestUploadPathUsesRsync(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync not available")
+	}
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initOpenTestVault(t, s)
+	src := filepath.Join(t.TempDir(), "source-dir")
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "nested", "a.txt"), []byte("rsync gui"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rr := postJSON(t, s, "/api/upload-path", map[string]any{
+		"sourcePath":  src,
+		"virtualPath": "local-rsync",
+		"method":      "rsync",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upload path failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var files struct {
+		Files []fileDTO `json:"files"`
+	}
+	if code := getJSON(t, s, "/api/files", &files); code != http.StatusOK {
+		t.Fatalf("files failed: %d", code)
+	}
+	if len(files.Files) != 1 || files.Files[0].Path != "local-rsync/nested/a.txt" {
+		t.Fatalf("unexpected files: %#v", files.Files)
+	}
+}
+
 func TestRcloneRemoteAndSSHKeyAPIs(t *testing.T) {
 	t.Setenv("SEAVAULT_APP_HOME", t.TempDir())
 	s, err := New("")
@@ -195,91 +325,66 @@ func TestRcloneRemoteAndSSHKeyAPIs(t *testing.T) {
 	}
 }
 
-func TestUploadFolderUsesRsyncAndPreservesRelativePaths(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("fake rsync script is POSIX-only")
-	}
-	rsync := filepath.Join(t.TempDir(), "rsync")
-	script := `#!/usr/bin/env sh
-set -eu
-if [ "${1:-}" = "--version" ]; then echo 'rsync  version 3.4.1'; exit 0; fi
-src=''
-dst=''
-for arg in "$@"; do
-  case "$arg" in
-    -*) ;;
-    *) src="$dst"; dst="$arg" ;;
-  esac
-done
-mkdir -p "$dst"
-case "$src" in
-  */) cp -R "$src". "$dst"/ ;;
-  *) cp "$src" "$dst"/ ;;
-esac
-`
-	if err := os.WriteFile(rsync, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-
+func TestExportAPIPlansAndExportsFolder(t *testing.T) {
 	s, err := New("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	vaultPath := filepath.Join(t.TempDir(), "cloud", "seavault")
-	rr := postJSON(t, s, "/api/init", map[string]any{
-		"vaultPath": vaultPath,
-		"password":  "passphrase",
-		"kdf":       "scrypt",
-		"scryptN":   16,
-		"scryptR":   1,
-		"scryptP":   1,
-	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("init failed: %d %s", rr.Code, rr.Body.String())
-	}
-
+	initOpenTestVault(t, s)
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
-	_ = mw.WriteField("path", "archive/")
-	_ = mw.WriteField("ingestMode", "rsync")
-	_ = mw.WriteField("rsyncBin", rsync)
+	if err := mw.WriteField("path", "docs/"); err != nil {
+		t.Fatal(err)
+	}
 	part, err := mw.CreateFormFile("files", "a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.WriteString(part, "alpha")
-	_ = mw.WriteField("relativePaths", "folder/a.txt")
-	part, err = mw.CreateFormFile("files", "b.txt")
-	if err != nil {
+	if _, err := part.Write([]byte("export me")); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.WriteString(part, "bravo")
-	_ = mw.WriteField("relativePaths", "folder/sub/b.txt")
 	if err := mw.Close(); err != nil {
 		t.Fatal(err)
 	}
-
 	req := httptest.NewRequest(http.MethodPost, "/api/upload", &body)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("X-SeaVault-Token", s.token)
-	rr = httptest.NewRecorder()
+	rr := httptest.NewRecorder()
 	s.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("upload failed: %d %s", rr.Code, rr.Body.String())
 	}
-	var upload uploadResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &upload); err != nil {
-		t.Fatal(err)
+	dest := filepath.Join(t.TempDir(), "export")
+	rr = postJSON(t, s, "/api/export", map[string]any{"virtualPath": "docs", "destPath": dest, "overwrite": "fail", "dryRun": true})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("export dry-run failed: %d %s", rr.Code, rr.Body.String())
 	}
-	if !upload.Ingest.UsedRsync {
-		t.Fatalf("expected rsync ingestion, got %#v", upload.Ingest)
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created destination, err=%v", err)
 	}
-	files, err := s.vault.List()
+	rr = postJSON(t, s, "/api/export", map[string]any{"virtualPath": "docs", "destPath": dest, "overwrite": "fail"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("export failed: %d %s", rr.Code, rr.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "a.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := strings.Join(files, "\n")
-	if !strings.Contains(got, "archive/folder/a.txt") || !strings.Contains(got, "archive/folder/sub/b.txt") {
-		t.Fatalf("unexpected files: %v", files)
+	if string(got) != "export me" {
+		t.Fatalf("exported file = %q", string(got))
+	}
+}
+
+func TestRsyncStatusAPI(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	if code := getJSON(t, s, "/api/rsync/status?binary=definitely-not-rsync", &st); code != http.StatusOK {
+		t.Fatalf("rsync status failed: %d", code)
+	}
+	if available, _ := st["available"].(bool); available {
+		t.Fatalf("expected fake rsync to be unavailable: %#v", st)
 	}
 }

@@ -18,6 +18,10 @@ printf 'hello encrypted cloud storage\n' > "$SRC"
 "$BIN" list "$VAULT" | grep -q '^docs/source.txt$'
 "$BIN" get "$VAULT" docs/source.txt "$OUT" >/dev/null
 cmp "$SRC" "$OUT"
+EXPORT_DIR="$WORK/export"
+"$BIN" export --dry-run "$VAULT" . "$EXPORT_DIR" >/dev/null
+"$BIN" export "$VAULT" docs "$EXPORT_DIR" >/dev/null
+cmp "$SRC" "$EXPORT_DIR/source.txt"
 "$BIN" verify "$VAULT" >/dev/null
 "$BIN" stats "$VAULT" >/dev/null
 "$BIN" remove "$VAULT" docs/source.txt >/dev/null
