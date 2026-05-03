@@ -5,6 +5,16 @@ SeaVault Fast is a cross-platform prototype for client-side encrypted storage. I
 This repository is a working MVP, not an audited production replacement for Cryptomator.
 
 
+
+## What changed in v0.12
+
+- Added move-vault-location support in the GUI and CLI.
+- Added `seavault move` for moving any vault path or saved profile to a new local location.
+- Added `seavault profile move` for moving a saved vault and updating its saved location.
+- The GUI now includes a Move vault location panel with source selection, destination path, remote-profile update, and destination replace controls.
+- Saved keychain passwords continue to work after a move because keychain entries are tied to the vault ID, not the folder path.
+- Matching remote profiles can be updated automatically after a move.
+
 ## What changed in v0.11
 
 - Added optional app-managed rsync runtime support. SeaVault now has managed tool controls for both rclone and rsync.
@@ -102,6 +112,26 @@ The GUI now has two folder options:
 
 The GUI shows a selected-file or selected-folder summary below each picker and warns when the virtual path appears to duplicate the selected folder name.
 
+
+
+## Move vault location
+
+A vault can be moved to a new local folder without changing the vault ID or re-encrypting data. This is useful when moving the encrypted vault from one sync-client folder to another, for example from `~/SeaVault/research` to `~/Nextcloud/research-seavault`.
+
+```bash
+# Move a saved vault profile and update matching remote profiles
+seavault profile move work-cloud ~/Nextcloud/seavault-work
+
+# Move any vault path or profile, and update a named saved location
+seavault move --profile work-cloud ~/SeaVault/work ~/Nextcloud/seavault-work
+
+# Replace an existing empty or disposable destination
+seavault profile move --replace work-cloud ~/Nextcloud/seavault-work
+```
+
+The move operation moves the entire encrypted vault folder, including `.seavault`. It rejects destinations inside the source vault to avoid recursive moves. If the move crosses filesystems, SeaVault falls back to a copy-then-remove workflow.
+
+Keychain entries do not need to be rewritten because they are stored by vault ID. If the GUI moves the active open vault and a keychain password is available, it attempts to reopen the vault automatically at the new location. Otherwise, the vault is safely closed and can be reopened from the new location.
 
 ## Bulk export
 

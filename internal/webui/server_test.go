@@ -432,3 +432,51 @@ func TestRsyncStatusAPI(t *testing.T) {
 		t.Fatalf("expected rsync status to include OS/default hint: %#v", st)
 	}
 }
+
+func TestVaultMoveAPIUpdatesSavedProfile(t *testing.T) {
+	appHome := filepath.Join(t.TempDir(), "app")
+	t.Setenv("SEAVAULT_APP_HOME", appHome)
+	root := t.TempDir()
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(root, "old-vault")
+	dst := filepath.Join(root, "new-vault")
+	rr := postJSON(t, s, "/api/init", map[string]any{
+		"vaultPath": src,
+		"password":  "passphrase",
+		"profile":   "move-me",
+		"kdf":       "pbkdf2",
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("init failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = postJSON(t, s, "/api/vault-move", map[string]any{
+		"profileName":          "move-me",
+		"destinationPath":      dst,
+		"updateRemoteProfiles": true,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("move failed: %d %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(dst, ".seavault", "vault.json")); err != nil {
+		t.Fatalf("destination metadata missing: %v", err)
+	}
+	var status statusResponse
+	if code := getJSON(t, s, "/api/status", &status); code != http.StatusOK {
+		t.Fatalf("status failed: %d", code)
+	}
+	found := false
+	for _, v := range status.AvailableVaults {
+		if v.Name == "move-me" {
+			found = true
+			if filepath.Clean(v.VaultPath) != filepath.Clean(dst) {
+				t.Fatalf("profile path not moved: %s", v.VaultPath)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("moved profile not found in status")
+	}
+}

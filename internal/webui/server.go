@@ -30,6 +30,7 @@ import (
 	rclonetransport "github.com/example/seavault-fast/internal/transport/rclone"
 	"github.com/example/seavault-fast/internal/userpath"
 	"github.com/example/seavault-fast/internal/vault"
+	"github.com/example/seavault-fast/internal/vaultmove"
 )
 
 type Server struct {
@@ -77,6 +78,14 @@ type profileRequest struct {
 	VaultPath    string `json:"vaultPath"`
 	Password     string `json:"password"`
 	SavePassword bool   `json:"savePassword"`
+}
+
+type vaultMoveRequest struct {
+	ProfileName          string `json:"profileName"`
+	SourcePath           string `json:"sourcePath"`
+	DestinationPath      string `json:"destinationPath"`
+	Replace              bool   `json:"replace"`
+	UpdateRemoteProfiles bool   `json:"updateRemoteProfiles"`
 }
 
 type rcloneInstallRequest struct {
@@ -247,6 +256,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleProfiles(w, r)
 	case "/api/profile":
 		s.handleProfile(w, r)
+	case "/api/vault-move":
+		s.handleVaultMove(w, r)
 	case "/api/rclone/status":
 		s.handleRcloneStatus(w, r)
 	case "/api/rsync/status":
@@ -660,6 +671,78 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleVaultMove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req vaultMoveRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.DestinationPath) == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "destination path is required"})
+		return
+	}
+	sourceArg := strings.TrimSpace(req.SourcePath)
+	if sourceArg == "" {
+		s.mu.Lock()
+		sourceArg = s.vaultPath
+		s.mu.Unlock()
+	}
+	if sourceArg == "" && strings.TrimSpace(req.ProfileName) == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "select a saved vault or enter a source vault path before moving"})
+		return
+	}
+
+	var res vaultmove.Result
+	var err error
+	if strings.TrimSpace(req.ProfileName) != "" {
+		res, err = vaultmove.MoveProfile(req.ProfileName, req.DestinationPath, vaultmove.Options{Replace: req.Replace, UpdateRemoteProfiles: req.UpdateRemoteProfiles})
+	} else {
+		resolved, resolveErr := resolveVaultArg(sourceArg)
+		if resolveErr != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: resolveErr.Error()})
+			return
+		}
+		res, err = vaultmove.Move(resolved, req.DestinationPath, vaultmove.Options{Replace: req.Replace, UpdateMatchingProfiles: true, UpdateRemoteProfiles: req.UpdateRemoteProfiles})
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+
+	reopened := false
+	closedActive := false
+	s.mu.Lock()
+	wasActive := s.vault != nil && samePath(s.vaultPath, res.SourcePath)
+	activeID := ""
+	if wasActive && s.vault != nil {
+		activeID = s.vault.ID()
+		s.vault = nil
+		s.vaultPath = res.DestinationPath
+		closedActive = true
+	}
+	s.mu.Unlock()
+	if wasActive && activeID != "" {
+		if password, err := keychain.Get(activeID); err == nil && password != "" {
+			if v, err := vault.Open(res.DestinationPath, password); err == nil {
+				s.mu.Lock()
+				s.vault = v
+				s.vaultPath = res.DestinationPath
+				s.mu.Unlock()
+				reopened = true
+				closedActive = false
+			} else {
+				res.Warnings = append(res.Warnings, "vault was moved, but it could not be reopened from the OS keychain: "+err.Error())
+			}
+		} else {
+			res.Warnings = append(res.Warnings, "vault was moved and closed because no OS keychain password was available for automatic reopen")
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "move": res, "reopened": reopened, "closedActive": closedActive})
 }
 
 func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
@@ -1316,6 +1399,7 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <nav class="jump-links" aria-label="Page sections">
     <a href="#vault-panel">Vault</a>
     <a href="#upload-panel">Upload</a>
+    <a href="#move-panel">Move vault</a>
     <a href="#export-panel">Export</a>
     <a href="#files-panel">Files</a>
     <a href="#remote-panel">Remote</a>
@@ -1414,6 +1498,37 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
     <button class="operation" onclick="uploadLocalPath()">Import local path</button>
     <button class="secondary" onclick="checkRsync()">Check rsync</button>
     <button class="danger" onclick="cancelActive()">Cancel active upload/export</button>
+  </p>
+</section>
+
+
+<section id="move-panel">
+  <h2>Move vault location</h2>
+  <p class="hint">Move the encrypted vault folder to another local disk or sync-client folder. The OS keychain entry is kept because it is tied to the vault ID, not the path. Saved vault and matching remote profiles are updated after a successful move.</p>
+  <div class="form-grid">
+    <label>Saved vault to move
+      <select id="moveProfile" onchange="fillMoveFromProfile()">
+        <option value="">Use active/manual source path</option>
+      </select>
+      <small>Select a saved vault, or leave blank to move the active/manual source path.</small>
+    </label>
+    <label>Source vault path
+      <input id="moveSource" placeholder="active vault or saved profile path" autocomplete="off">
+      <small>Leave blank to move the active open vault, or enter a vault path/profile.</small>
+    </label>
+    <label>New vault location
+      <input id="moveDest" placeholder="~/Nextcloud/seavault-new" autocomplete="off">
+      <small>Choose the new encrypted vault folder location. Do not choose a folder inside the existing vault.</small>
+    </label>
+    <label>Move options
+      <span class="checkline"><input id="moveUpdateRemotes" type="checkbox" checked> Update matching remote profiles</span>
+      <span class="checkline"><input id="moveReplace" type="checkbox"> Replace existing destination if present</span>
+      <small>Replace removes the destination path first. Use it only when you are certain it does not contain needed data.</small>
+    </label>
+  </div>
+  <p class="row-actions">
+    <button class="operation" onclick="moveVaultLocation()">Move vault location</button>
+    <button class="secondary" onclick="prefillMoveFromActive()">Use active vault as source</button>
   </p>
 </section>
 
@@ -1616,11 +1731,42 @@ function humanize(obj){
   if(obj.open !== undefined){
     return (obj.open ? 'Vault is open.' : 'No vault is open.') + (obj.vaultPath ? '\nVault path: ' + obj.vaultPath : '') + '\n\n' + JSON.stringify(obj, null, 2);
   }
+  if(obj.move){ return 'Vault move complete.\nFrom: ' + obj.move.sourcePath + '\nTo: ' + obj.move.destinationPath + '\nUpdated saved vault locations: ' + (obj.move.updatedProfiles||0) + '\nUpdated remote profiles: ' + (obj.move.updatedRemotes||0) + (obj.reopened ? '\nVault reopened from OS keychain.' : (obj.closedActive ? '\nVault was moved and closed. Reopen it with a saved keychain password or typed password.' : '')) + ((obj.move.warnings||[]).length ? '\nWarnings: ' + obj.move.warnings.join('; ') : '') + '\n\n' + JSON.stringify(obj, null, 2); }
   if(obj.ok){ return 'Operation completed successfully.\n\n' + JSON.stringify(obj, null, 2); }
   return JSON.stringify(obj, null, 2);
 }
 function fmtBytes(n){ n=Number(n||0); const units=['B','KiB','MiB','GiB','TiB']; let i=0; while(n>=1024 && i<units.length-1){ n/=1024; i++; } return (i===0?String(n):n.toFixed(1))+' '+units[i]; }
 function fillPath(p){ $('vaultPath').value = p; }
+
+function prefillMoveFromActive(){
+  if(lastStatus && lastStatus.vaultPath){ $('moveSource').value = lastStatus.vaultPath; showHuman('Move source selected', 'Using active vault as the move source: ' + lastStatus.vaultPath); }
+  else showError('No active vault', 'Open a vault first, select a saved vault, or type a source path manually.');
+}
+function fillMoveFromProfile(){
+  const sel = $('moveProfile');
+  const opt = sel.options[sel.selectedIndex];
+  if(!opt || !opt.value) return;
+  $('moveSource').value = opt.dataset.path || '';
+  showHuman('Move source selected', 'Selected saved vault ' + opt.value + ' at ' + (opt.dataset.path || '') + '.');
+}
+async function moveVaultLocation(){
+  try {
+    const req = {profileName:$('moveProfile').value, sourcePath:$('moveSource').value, destinationPath:$('moveDest').value, replace:$('moveReplace').checked, updateRemoteProfiles:$('moveUpdateRemotes').checked};
+    if(!req.destinationPath.trim()){ showError('Destination required', 'Enter the new vault location before moving.'); return; }
+    if(!req.profileName && !req.sourcePath.trim() && !(lastStatus && lastStatus.vaultPath)){ showError('Source required', 'Select a saved vault, use the active vault, or type a source vault path.'); return; }
+    if(!req.sourcePath.trim() && lastStatus && lastStatus.vaultPath) req.sourcePath = lastStatus.vaultPath;
+    const from = req.profileName || req.sourcePath;
+    const ok = window.confirm('Move encrypted vault from "' + from + '" to "' + req.destinationPath + '"?\n\nThe app will update saved vault locations after the move. The keychain password remains tied to the vault ID.');
+    if(!ok) return;
+    beginOperation('Moving vault location...');
+    const res = await api('/api/vault-move',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)});
+    endOperation('Vault move complete.');
+    showHuman('Vault moved', res, 'success');
+    $('vaultPath').value = res.move && res.move.destinationPath ? res.move.destinationPath : req.destinationPath;
+    await refreshStatus();
+  } catch(e){ showError('Vault move failed', e.message); activeController=null; setBusy(false); }
+}
+
 function selectSavedVault(){
   const sel = $('vaultSelect');
   const opt = sel.options[sel.selectedIndex];
@@ -1630,11 +1776,17 @@ function selectSavedVault(){
   showHuman('Saved vault selected', 'Selected ' + (opt.dataset.name || opt.value) + '. Click Open selected using keychain, or enter the password and open.');
 }
 function renderVaultSelector(status){
-  const sel = $('vaultSelect');
-  if(!sel) return;
-  const current = sel.value;
   const rows = status.availableVaults || [];
-  sel.innerHTML = '<option value="">Manual path or new vault</option>' + rows.map(v => '<option value="'+esc(v.name)+'" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'"'+((current && current===v.name) || (!current && status.vaultPath===v.vaultPath)?' selected':'')+'>'+esc(v.name)+' - '+esc(v.status)+'</option>').join('');
+  const sel = $('vaultSelect');
+  if(sel){
+    const current = sel.value;
+    sel.innerHTML = '<option value="">Manual path or new vault</option>' + rows.map(v => '<option value="'+esc(v.name)+'" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'"'+((current && current===v.name) || (!current && status.vaultPath===v.vaultPath)?' selected':'')+'>'+esc(v.name)+' - '+esc(v.status)+'</option>').join('');
+  }
+  const moveSel = $('moveProfile');
+  if(moveSel){
+    const currentMove = moveSel.value;
+    moveSel.innerHTML = '<option value="">Use active/manual source path</option>' + rows.map(v => '<option value="'+esc(v.name)+'" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'"'+(currentMove===v.name?' selected':'')+'>'+esc(v.name)+' - '+esc(v.status)+'</option>').join('');
+  }
 }
 function renderAvailableVaults(status){
   const box = $('availableVaults');
@@ -1804,9 +1956,10 @@ async function deleteFile(p){ try { await api('/api/file?path='+p,{method:'DELET
 async function verifyVault(){ try { const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault verification passed', res, 'success'); } catch(e){ showError('Vault verification failed', e.message); } }
 async function loadStats(){ try { const res = await api('/api/stats'); showHuman('Vault statistics', res); } catch(e){ showError('Could not load stats', e.message); } }
 async function loadProfiles(){
-  try { const data = await api('/api/profiles'); const rows = data.profiles || []; $('profiles').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Vault path</th><th>Actions</th></tr></thead><tbody>'+rows.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="path">'+esc(p.vaultPath)+'</td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="openSavedVault(this.dataset.name,this.dataset.path,true)">Open with keychain</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>').join('')+'</tbody></table>' : '<p>No saved vault locations.</p>'; }
+  try { const data = await api('/api/profiles'); const rows = data.profiles || []; $('profiles').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Vault path</th><th>Actions</th></tr></thead><tbody>'+rows.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="path">'+esc(p.vaultPath)+'</td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="openSavedVault(this.dataset.name,this.dataset.path,true)">Open with keychain</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectMoveProfile(this.dataset.name,this.dataset.path)">Move</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>').join('')+'</tbody></table>' : '<p>No saved vault locations.</p>'; }
   catch(e){ $('profiles').innerHTML = '<p>'+esc(e.message)+'</p>'; }
 }
+function selectMoveProfile(name,path){ $('moveProfile').value=name; $('moveSource').value=path; $('moveDest').value=''; showHuman('Move source selected', 'Selected saved vault ' + name + '. Enter the new vault location, then click Move vault location.'); location.hash='move-panel'; }
 async function deleteProfile(name){ try { await api('/api/profile?name='+encodeURIComponent(name),{method:'DELETE',headers:jsonHeaders}); showHuman('Saved vault removed', 'Removed saved vault location ' + name + '. The vault files and keychain password were not deleted.', 'success'); await refreshStatus(); } catch(e){ showError('Could not remove saved vault', e.message); } }
 async function rcloneStatus(check){ try { const s = await api('/api/rclone/status?checkUpdate='+(check?'1':'0')); $('rcloneStatus').textContent = JSON.stringify(s,null,2); } catch(e){ $('rcloneStatus').textContent = e.message; } }
 async function rcloneInstall(){ try { const req={version:$('rcloneVersion').value, channel:'stable', fromBinary:$('rcloneFromBinary').value, signature:$('rcloneSignature').value}; const res=await api('/api/rclone/install',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); showHuman('Rclone install/register complete', res, 'success'); } catch(e){ $('rcloneStatus').textContent=e.message; showError('Rclone install/register failed', e.message); } }

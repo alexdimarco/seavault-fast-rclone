@@ -27,10 +27,11 @@ import (
 	rclonetransport "github.com/example/seavault-fast/internal/transport/rclone"
 	"github.com/example/seavault-fast/internal/userpath"
 	"github.com/example/seavault-fast/internal/vault"
+	"github.com/example/seavault-fast/internal/vaultmove"
 	"github.com/example/seavault-fast/internal/webui"
 )
 
-const version = "0.11.0"
+const version = "0.12.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -64,6 +65,8 @@ func main() {
 		err = cmdGUI(os.Args[2:])
 	case "profile":
 		err = cmdProfile(os.Args[2:])
+	case "move":
+		err = cmdMove(os.Args[2:])
 	case "keychain":
 		err = cmdKeychain(os.Args[2:])
 	case "rclone":
@@ -460,9 +463,48 @@ func cmdGUI(args []string) error {
 	return http.ListenAndServe(*addr, s)
 }
 
+func cmdMove(args []string) error {
+	fs := flag.NewFlagSet("move", flag.ExitOnError)
+	profileName := fs.String("profile", "", "saved vault name to update after moving")
+	replace := fs.Bool("replace", false, "replace an existing destination directory")
+	updateRemotes := fs.Bool("update-remotes", true, "update remote profiles that point at the old vault path")
+	updateMatching := fs.Bool("update-matching-profiles", true, "update saved vault locations that point at the old vault path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return fmt.Errorf("usage: seavault move [--profile NAME] [--replace] [--update-remotes=true] SOURCE_VAULT_DIR_OR_PROFILE DEST_VAULT_DIR")
+	}
+	sourceArg := fs.Arg(0)
+	destArg := fs.Arg(1)
+	sourcePath, err := resolveVaultArg(sourceArg)
+	if err != nil {
+		return err
+	}
+	if *profileName == "" {
+		if e, ok, err := profile.Resolve(sourceArg); err != nil {
+			return err
+		} else if ok {
+			*profileName = e.Name
+		}
+	}
+	res, err := vaultmove.Move(sourcePath, destArg, vaultmove.Options{ProfileName: *profileName, Replace: *replace, UpdateMatchingProfiles: *updateMatching, UpdateRemoteProfiles: *updateRemotes})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("moved vault from %s to %s\n", res.SourcePath, res.DestinationPath)
+	if res.UpdatedProfiles > 0 || res.UpdatedRemotes > 0 {
+		fmt.Printf("updated %d saved vault location(s) and %d remote profile(s)\n", res.UpdatedProfiles, res.UpdatedRemotes)
+	}
+	for _, warning := range res.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", warning)
+	}
+	return nil
+}
+
 func cmdProfile(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: seavault profile add [--save-password] NAME VAULT_DIR | save [--save-password] NAME VAULT_DIR | list [--status] | remove NAME")
+		return fmt.Errorf("usage: seavault profile add [--save-password] NAME VAULT_DIR | save [--save-password] NAME VAULT_DIR | move [--replace] [--update-remotes=true] NAME NEW_VAULT_DIR | list [--status] | remove NAME")
 	}
 	switch args[0] {
 	case "add", "save":
@@ -497,6 +539,28 @@ func cmdProfile(args []string) error {
 			return nil
 		}
 		fmt.Printf("profile %s -> %s\n", entry.Name, entry.VaultPath)
+		return nil
+	case "move":
+		fs := flag.NewFlagSet("profile move", flag.ExitOnError)
+		replace := fs.Bool("replace", false, "replace an existing destination directory")
+		updateRemotes := fs.Bool("update-remotes", true, "update remote profiles that point at the old vault path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 2 {
+			return fmt.Errorf("usage: seavault profile move [--replace] [--update-remotes=true] NAME NEW_VAULT_DIR")
+		}
+		res, err := vaultmove.MoveProfile(fs.Arg(0), fs.Arg(1), vaultmove.Options{Replace: *replace, UpdateRemoteProfiles: *updateRemotes})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("moved saved vault %s from %s to %s\n", fs.Arg(0), res.SourcePath, res.DestinationPath)
+		if res.UpdatedProfiles > 0 || res.UpdatedRemotes > 0 {
+			fmt.Printf("updated %d saved vault location(s) and %d remote profile(s)\n", res.UpdatedProfiles, res.UpdatedRemotes)
+		}
+		for _, warning := range res.Warnings {
+			fmt.Fprintln(os.Stderr, "warning:", warning)
+		}
 		return nil
 	case "list":
 		fs := flag.NewFlagSet("profile list", flag.ExitOnError)
@@ -1149,6 +1213,8 @@ Usage:
   seavault gui [flags] [VAULT_DIR_OR_PROFILE]
   seavault profile add [--save-password] NAME VAULT_DIR
   seavault profile save [--save-password] NAME VAULT_DIR
+  seavault profile move [--replace] [--update-remotes=true] NAME NEW_VAULT_DIR
+  seavault move [--profile NAME] [--replace] SOURCE_VAULT_DIR_OR_PROFILE DEST_VAULT_DIR
   seavault profile list [--status]
   seavault profile remove NAME
   seavault keychain store VAULT_DIR_OR_PROFILE
