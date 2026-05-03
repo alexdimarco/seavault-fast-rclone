@@ -21,8 +21,8 @@ printf 'nested beta\n' > "$SRC/nested/beta.txt"
 
 "$BIN" init -kdf scrypt -scrypt-n 16 -scrypt-r 1 -scrypt-p 1 "$VAULT" >/dev/null
 "$BIN" put --method rsync "$VAULT" "$SRC" archive >/dev/null
-"$BIN" list "$VAULT" | grep -q '^archive/root.txt$'
-"$BIN" list "$VAULT" | grep -q '^archive/nested/beta.txt$'
+"$BIN" list "$VAULT" | grep -q '^content/archive/root.txt$'
+"$BIN" list "$VAULT" | grep -q '^content/archive/nested/beta.txt$'
 "$BIN" get "$VAULT" archive "$OUT" >/dev/null
 cmp "$SRC/root.txt" "$OUT/root.txt"
 cmp "$SRC/nested/beta.txt" "$OUT/nested/beta.txt"

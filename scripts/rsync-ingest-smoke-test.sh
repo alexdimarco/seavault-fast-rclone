@@ -16,9 +16,9 @@ printf 'bravo\n' > "$SRC/sub/b.txt"
 
 "$BIN" init -kdf scrypt -scrypt-n 16 -scrypt-r 1 -scrypt-p 1 "$VAULT" >/dev/null
 "$BIN" rsync status >/dev/null
-"$BIN" put --ingest rsync "$VAULT" "$SRC" archive >/dev/null
-"$BIN" list "$VAULT" | grep -q '^archive/a.txt$'
-"$BIN" list "$VAULT" | grep -q '^archive/sub/b.txt$'
+"$BIN" put --method rsync "$VAULT" "$SRC" archive >/dev/null
+"$BIN" list "$VAULT" | grep -q '^content/archive/a.txt$'
+"$BIN" list "$VAULT" | grep -q '^content/archive/sub/b.txt$'
 "$BIN" get "$VAULT" archive "$OUT" >/dev/null
 cmp "$SRC/a.txt" "$OUT/a.txt"
 cmp "$SRC/sub/b.txt" "$OUT/sub/b.txt"

@@ -92,40 +92,35 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok, err := s.Vault.FileInfo(vp)
+	files, err := s.Vault.AllEntries()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !ok {
-		files, err := s.Vault.Files()
-		if err != nil {
+	if rec, ok := files[vp]; ok && !vault.IsInternalVirtualPath(vp) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", rec.Size))
+		w.Header().Set("ETag", etagForRecord(vp, rec))
+		if t, err := time.Parse(time.RFC3339Nano, rec.ModTime); err == nil {
+			w.Header().Set("Last-Modified", t.UTC().Format(http.TimeFormat))
+		}
+		if r.Method == http.MethodHead {
+			return
+		}
+		if err := s.Vault.WriteFileTo(vp, w); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
 		}
-		if directoryExists(files, vp) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if r.Method == http.MethodHead {
-				return
-			}
-			_ = writeDirectoryHTML(w, s, files, vp)
-			return
-		}
-		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", rec.Size))
-	w.Header().Set("ETag", etagForRecord(vp, rec))
-	if t, err := time.Parse(time.RFC3339Nano, rec.ModTime); err == nil {
-		w.Header().Set("Last-Modified", t.UTC().Format(http.TimeFormat))
-	}
-	if r.Method == http.MethodHead {
+	if vp == "" || directoryExists(files, vp) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.Method == http.MethodHead {
+			return
+		}
+		_ = writeDirectoryHTML(w, s, files, vp)
 		return
 	}
-	if err := s.Vault.WriteFileTo(vp, w); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
+	http.NotFound(w, r)
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
@@ -178,7 +173,22 @@ func (s *Server) handleMkcol(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if vp == "" {
-		http.Error(w, "root collection already exists", http.StatusMethodNotAllowed)
+		http.Error(w, "root collection already exists; use content/ as the writable workspace", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	exists, err := s.Vault.DirectoryExists(vp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if exists {
+		http.Error(w, "collection already exists", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.Vault.EnsureDirectory(vp); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -229,15 +239,21 @@ func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, move boo
 }
 
 func (s *Server) copyPath(src, dst string) (int, error) {
-	files, err := s.Vault.Files()
+	files, err := s.Vault.AllEntries()
 	if err != nil {
 		return 0, err
 	}
-	if rec, ok := files[src]; ok {
+	if vault.IsInternalVirtualPath(src) || vault.IsInternalVirtualPath(dst) {
+		return 0, fmt.Errorf("reserved paths cannot be copied")
+	}
+	if rec, ok := files[src]; ok && !vault.IsInternalVirtualPath(src) {
 		return 1, s.copyFile(src, dst, rec)
 	}
 	if !directoryExists(files, src) {
 		return 0, fmt.Errorf("source path %q not found", src)
+	}
+	if err := s.Vault.EnsureDirectory(dst); err != nil {
+		return 0, err
 	}
 	prefix := src
 	if prefix != "" {
@@ -255,6 +271,19 @@ func (s *Server) copyPath(src, dst string) (int, error) {
 		rel := p
 		if prefix != "" {
 			rel = strings.TrimPrefix(p, prefix)
+		}
+		if rel == "" {
+			continue
+		}
+		if vault.IsDirectoryMarkerPath(p) {
+			dirRel := strings.TrimSuffix(rel, "/"+vault.DirectoryMarkerName)
+			if dirRel == vault.DirectoryMarkerName {
+				dirRel = ""
+			}
+			if err := s.Vault.EnsureDirectory(path.Join(dst, dirRel)); err != nil {
+				return count, err
+			}
+			continue
 		}
 		destPath := path.Join(dst, rel)
 		if err := s.copyFile(p, destPath, files[p]); err != nil {
@@ -302,7 +331,7 @@ func (s *Server) handlePropfind(w http.ResponseWriter, r *http.Request) {
 		depth = "1"
 	}
 	s.mu.Lock()
-	files, err := s.Vault.Files()
+	files, err := s.Vault.AllEntries()
 	s.mu.Unlock()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -335,7 +364,7 @@ type responseInfo struct {
 func propfindResponses(files map[string]vault.FileRecord, vp string, depth string, base string) ([]responseInfo, bool) {
 	vp = strings.Trim(vp, "/")
 	var out []responseInfo
-	if rec, ok := files[vp]; ok {
+	if rec, ok := files[vp]; ok && !vault.IsInternalVirtualPath(vp) {
 		out = append(out, responseInfo{Href: href(base, vp, false), IsDir: false, Size: rec.Size, ModTime: rec.ModTime, ETag: etagForRecord(vp, rec)})
 		return out, true
 	}
@@ -365,6 +394,23 @@ func propfindResponses(files map[string]vault.FileRecord, vp string, depth strin
 		if rest == "" {
 			continue
 		}
+		if vault.IsDirectoryMarkerPath(p) {
+			dirRest := strings.TrimSuffix(rest, "/"+vault.DirectoryMarkerName)
+			if dirRest == vault.DirectoryMarkerName {
+				continue
+			}
+			if dirRest != "" {
+				first := dirRest
+				if slash := strings.Index(first, "/"); slash >= 0 {
+					first = first[:slash]
+				}
+				childDirs[path.Join(vp, first)] = true
+			}
+			continue
+		}
+		if vault.IsInternalVirtualPath(p) {
+			continue
+		}
 		if slash := strings.Index(rest, "/"); slash >= 0 {
 			childDirs[path.Join(vp, rest[:slash])] = true
 			continue
@@ -386,6 +432,9 @@ func propfindResponses(files map[string]vault.FileRecord, vp string, depth strin
 
 func directoryExists(files map[string]vault.FileRecord, vp string) bool {
 	if vp == "" {
+		return true
+	}
+	if _, ok := files[path.Join(vp, vault.DirectoryMarkerName)]; ok {
 		return true
 	}
 	prefix := strings.TrimSuffix(vp, "/") + "/"
@@ -428,17 +477,15 @@ func (s *Server) virtualPathFromDestination(destination string) (string, error) 
 }
 
 func cleanDAVVirtualPath(input string) (string, error) {
-	vp, err := vault.CleanVirtualPath(input)
+	if strings.Trim(strings.ReplaceAll(input, "\\", "/"), "/ ") == "" {
+		return "", nil
+	}
+	vp, err := vault.NormalizeContentPath(input)
 	if err != nil {
 		return "", err
 	}
-	if vp == ".seavault" || strings.HasPrefix(vp, ".seavault/") {
-		return "", fmt.Errorf(".seavault internals are not exposed through WebDAV")
-	}
-	for _, seg := range strings.Split(vp, "/") {
-		if seg == ".seavault" {
-			return "", fmt.Errorf(".seavault internals are not exposed through WebDAV")
-		}
+	if vault.IsInternalVirtualPath(vp) {
+		return "", fmt.Errorf("reserved vault internals are not exposed through WebDAV")
 	}
 	return vp, nil
 }

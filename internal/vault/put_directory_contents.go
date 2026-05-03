@@ -27,8 +27,10 @@ func (v *Vault) PutDirectoryContents(sourceDir string, virtualBase string) ([]Pu
 	}
 
 	base := strings.TrimSpace(virtualBase)
-	if base != "" {
-		base, err = CleanVirtualPath(base)
+	if base == "" {
+		base = ContentRootName
+	} else {
+		base, err = normalizeContentDirPath(base)
 		if err != nil {
 			return nil, err
 		}

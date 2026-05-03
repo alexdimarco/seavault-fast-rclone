@@ -80,7 +80,7 @@ test -f "$REMOTE/.seavault/vault.json"
 "$BIN" remote check rclone-local >/dev/null
 "$BIN" remote add --backend local pulled "$VAULT2" "$REMOTE" >/dev/null
 "$BIN" remote pull pulled >/dev/null
-"$BIN" list "$VAULT2" | grep -q '^docs/source.txt$'
+"$BIN" list "$VAULT2" | grep -q '^content/docs/source.txt$'
 "$BIN" get "$VAULT2" docs/source.txt "$OUT" >/dev/null
 cmp "$SRC" "$OUT"
 

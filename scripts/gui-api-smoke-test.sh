@@ -63,7 +63,7 @@ mkdir -p "$SRC_DIR/nested"
 printf 'gui rsync path upload\n' > "$SRC_DIR/nested/upload.txt"
 UPLOAD_BODY=$(printf '{"sourcePath":"%s","virtualPath":"gui-folder","method":"auto"}' "$SRC_DIR")
 post_json /api/upload-path "$UPLOAD_BODY" | grep -q '"results"'
-curl -fsS "$URL/api/files" | grep -q '"path":"gui-folder/nested/upload.txt"'
+curl -fsS "$URL/api/files" | grep -q '"path":"content/gui-folder/nested/upload.txt"'
 EXPORT_DIR="$WORK/gui-export"
 post_json /api/export "{\"virtualPath\":\"gui-folder\",\"destPath\":\"$EXPORT_DIR\",\"overwrite\":\"fail\",\"dryRun\":true}" | grep -q '"files":1'
 post_json /api/export "{\"virtualPath\":\"gui-folder\",\"destPath\":\"$EXPORT_DIR\",\"overwrite\":\"fail\"}" | grep -q '"exported":1'

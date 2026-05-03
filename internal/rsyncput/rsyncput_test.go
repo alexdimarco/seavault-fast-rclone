@@ -41,7 +41,7 @@ func TestAutoFallsBackToNativeWhenRsyncMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) != 1 || paths[0] != "docs/source.txt" {
+	if len(paths) != 1 || paths[0] != "content/docs/source.txt" {
 		t.Fatalf("unexpected paths: %#v", paths)
 	}
 }
@@ -69,7 +69,7 @@ func TestRsyncPutFolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) != 1 || paths[0] != "archive/nested/file.txt" {
+	if len(paths) != 1 || paths[0] != "content/archive/nested/file.txt" {
 		t.Fatalf("unexpected paths: %#v", paths)
 	}
 }

@@ -154,12 +154,12 @@ func (v *Vault) exportMatches(virtualPath string) ([]string, Index, string, erro
 	if err != nil {
 		return nil, Index{}, "", err
 	}
-	vp, err := CleanVirtualPath(virtualPath)
+	vp, err := normalizeContentDirPath(virtualPath)
 	if err != nil {
 		return nil, Index{}, "", err
 	}
-	if _, ok := idx.Files[vp]; ok && vp != "" {
-		return []string{vp}, idx, vp, nil
+	if _, ok := idx.Files[vp]; ok && vp != "" && !IsInternalVirtualPath(vp) {
+		return []string{vp}, visibleIndex(idx), vp, nil
 	}
 	prefix := vp
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
@@ -167,6 +167,9 @@ func (v *Vault) exportMatches(virtualPath string) ([]string, Index, string, erro
 	}
 	var matches []string
 	for p := range idx.Files {
+		if IsInternalVirtualPath(p) {
+			continue
+		}
 		if prefix == "" || strings.HasPrefix(p, prefix) {
 			matches = append(matches, p)
 		}
@@ -175,7 +178,7 @@ func (v *Vault) exportMatches(virtualPath string) ([]string, Index, string, erro
 		return nil, Index{}, "", fmt.Errorf("virtual path %q not found", virtualPath)
 	}
 	sort.Strings(matches)
-	return matches, idx, vp, nil
+	return matches, visibleIndex(idx), vp, nil
 }
 
 func exportRelativePath(p, vp string, exactFile bool) string {

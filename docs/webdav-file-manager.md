@@ -20,7 +20,9 @@ When a vault is unlocked, the GUI exposes a local virtual plaintext view:
 /dav/<session-token>/        local WebDAV endpoint
 ```
 
-The WebDAV endpoint never exposes raw `.seavault` internals.
+All user-created files and folders live under the protected `content/` workspace. The WebDAV root shows `content/`; file operations occur inside it. Older vaults that do not have this structure are migrated automatically when opened.
+
+The WebDAV endpoint never exposes raw `.seavault` internals or internal `.seavault-dir` directory markers.
 
 ## Supported operations
 
@@ -29,7 +31,7 @@ The WebDAV endpoint never exposes raw `.seavault` internals.
 | Browse folders | `PROPFIND` | Used by the in-app file manager. |
 | Download file | `GET` | Decrypted response has `Cache-Control: no-store`. |
 | Upload file | `PUT` | Encrypts into the vault immediately. |
-| Create folder | `MKCOL` | Empty folders are virtual until files are added. |
+| Create folder | `MKCOL` | Creates an encrypted `.seavault-dir` directory marker hidden from users and exports. |
 | Delete | `DELETE` | Uses vault removal/tombstone handling. |
 | Rename/move | `MOVE` | Moves files or directory prefixes inside the virtual view. |
 | Copy | `COPY` | Copies files or directory prefixes inside the virtual view. |
@@ -44,7 +46,8 @@ The WebDAV endpoint never exposes raw `.seavault` internals.
 - Decrypted WebDAV responses include no-store headers.
 - Path traversal is rejected.
 - Absolute virtual paths are rejected.
-- `.seavault` is blocked anywhere in the requested virtual path.
+- `.seavault` and `.seavault-dir` are blocked anywhere in user-controlled virtual paths.
+- The protected `content/` workspace cannot be deleted or moved.
 - Read-only mode rejects `PUT`, `DELETE`, `MKCOL`, `MOVE`, and `COPY`.
 - The app does not log vault passwords or WebDAV session tokens.
 

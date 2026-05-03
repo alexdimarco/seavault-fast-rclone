@@ -169,7 +169,21 @@ func CreateWithOptions(root string, password string, opts CreateOptions) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(configPath, cfgJSON, 0o600)
+	if err := atomicWriteFile(configPath, cfgJSON, 0o600); err != nil {
+		return err
+	}
+	chunkKey := deriveSubkey(master, "chunk-aead")
+	indexAEADKey := deriveSubkey(master, "index-aead")
+	chunkAEAD, err := newAESGCM(chunkKey)
+	if err != nil {
+		return err
+	}
+	indexAEAD, err := newAESGCM(indexAEADKey)
+	if err != nil {
+		return err
+	}
+	v := &Vault{Root: root, MetaRoot: meta, Config: cfg, keys: Keys{MasterKey: master, IndexKey: indexKey}, chunkAEAD: chunkAEAD, indexAEAD: indexAEAD}
+	return v.EnsureContentLayout()
 }
 
 func ReadConfig(root string) (VaultConfig, error) {
@@ -221,7 +235,11 @@ func Open(root string, password string) (*Vault, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Vault{Root: root, MetaRoot: filepath.Join(root, MetadataDirName), Config: cfg, keys: keys, chunkAEAD: chunkAEAD, indexAEAD: indexAEAD}, nil
+	v := &Vault{Root: root, MetaRoot: filepath.Join(root, MetadataDirName), Config: cfg, keys: keys, chunkAEAD: chunkAEAD, indexAEAD: indexAEAD}
+	if err := v.EnsureContentLayout(); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 func (v *Vault) ID() string {
@@ -317,7 +335,7 @@ func (v *Vault) PutPath(sourcePath string, virtualPath string) ([]PutResult, err
 		if strings.TrimSpace(vp) == "" {
 			vp = filepath.Base(sourcePath)
 		}
-		cleaned, err := CleanVirtualPath(vp)
+		cleaned, err := normalizeContentFilePath(vp)
 		if err != nil {
 			return nil, err
 		}
@@ -331,6 +349,10 @@ func (v *Vault) PutPath(sourcePath string, virtualPath string) ([]PutResult, err
 		baseVirtual := virtualPath
 		if strings.TrimSpace(baseVirtual) == "" {
 			baseVirtual = filepath.Base(sourcePath)
+		}
+		baseVirtual, err = normalizeContentDirPath(baseVirtual)
+		if err != nil {
+			return nil, err
 		}
 		err := filepath.WalkDir(sourcePath, func(p string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
@@ -392,12 +414,9 @@ func (v *Vault) PutReader(r io.Reader, virtualPath string, size int64, mode uint
 	if err != nil {
 		return PutResult{}, err
 	}
-	vp, err := CleanVirtualPath(virtualPath)
+	vp, err := normalizeContentFilePath(virtualPath)
 	if err != nil {
 		return PutResult{}, err
-	}
-	if vp == "" {
-		return PutResult{}, errors.New("virtual file path must not be empty")
 	}
 	res, err := v.putReader(r, vp, size, mode, modTime, &idx)
 	if err != nil {
@@ -475,7 +494,7 @@ func (v *Vault) GetPath(virtualPath string, destPath string) error {
 	if err != nil {
 		return err
 	}
-	vp, err := CleanVirtualPath(virtualPath)
+	vp, err := normalizeContentDirPath(virtualPath)
 	if err != nil {
 		return err
 	}
@@ -558,7 +577,7 @@ func (v *Vault) WriteFileTo(virtualPath string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	vp, err := CleanVirtualPath(virtualPath)
+	vp, err := normalizeContentFilePath(virtualPath)
 	if err != nil {
 		return err
 	}
@@ -608,6 +627,9 @@ func (v *Vault) List() ([]string, error) {
 	}
 	out := make([]string, 0, len(idx.Files))
 	for p := range idx.Files {
+		if IsInternalVirtualPath(p) {
+			continue
+		}
 		out = append(out, p)
 	}
 	sort.Strings(out)
@@ -619,7 +641,7 @@ func (v *Vault) FileInfo(virtualPath string) (FileRecord, bool, error) {
 	if err != nil {
 		return FileRecord{}, false, err
 	}
-	vp, err := CleanVirtualPath(virtualPath)
+	vp, err := normalizeContentFilePath(virtualPath)
 	if err != nil {
 		return FileRecord{}, false, err
 	}
@@ -628,6 +650,22 @@ func (v *Vault) FileInfo(virtualPath string) (FileRecord, bool, error) {
 }
 
 func (v *Vault) Files() (map[string]FileRecord, error) {
+	idx, err := v.LoadIndex()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]FileRecord, len(idx.Files))
+	for k, rec := range idx.Files {
+		if IsInternalVirtualPath(k) {
+			continue
+		}
+		rec.Chunks = append([]ChunkRef(nil), rec.Chunks...)
+		out[k] = rec
+	}
+	return out, nil
+}
+
+func (v *Vault) AllEntries() (map[string]FileRecord, error) {
 	idx, err := v.LoadIndex()
 	if err != nil {
 		return nil, err
@@ -656,9 +694,12 @@ func (v *Vault) RemovePath(virtualPath string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	vp, err := CleanVirtualPath(virtualPath)
+	vp, err := normalizeContentDirPath(virtualPath)
 	if err != nil {
 		return 0, err
+	}
+	if vp == ContentRootName {
+		return 0, fmt.Errorf("%s/ is the protected vault workspace and cannot be deleted", ContentRootName)
 	}
 	var targets []string
 	if _, ok := idx.Files[vp]; ok {
@@ -761,7 +802,12 @@ func (v *Vault) Stats() (Stats, error) {
 	}
 	live := map[string]int{}
 	var referencedBytes int64
-	for _, rec := range idx.Files {
+	visibleFiles := 0
+	for p, rec := range idx.Files {
+		if IsInternalVirtualPath(p) {
+			continue
+		}
+		visibleFiles++
 		for _, ref := range rec.Chunks {
 			live[ref.ID] = ref.Size
 			referencedBytes += int64(ref.Size)
@@ -777,7 +823,7 @@ func (v *Vault) Stats() (Stats, error) {
 		}
 		return nil
 	})
-	return Stats{Files: len(idx.Files), Referenced: len(live), Objects: objects, ReferencedMB: float64(referencedBytes) / 1024.0 / 1024.0}, nil
+	return Stats{Files: visibleFiles, Referenced: len(live), Objects: objects, ReferencedMB: float64(referencedBytes) / 1024.0 / 1024.0}, nil
 }
 
 func (v *Vault) chunkPath(id string) string {

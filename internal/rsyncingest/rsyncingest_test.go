@@ -75,7 +75,7 @@ func TestPutPathUsesRsyncStagingForDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Join(paths, "\n")
-	if !strings.Contains(got, "source/a.txt") || !strings.Contains(got, "source/sub/b.txt") {
+	if !strings.Contains(got, "content/source/a.txt") || !strings.Contains(got, "content/source/sub/b.txt") {
 		t.Fatalf("unexpected paths: %v", paths)
 	}
 }
@@ -127,7 +127,7 @@ func TestAutoFallsBackToDirectWhenRsyncMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) != 1 || paths[0] != "a.txt" {
+	if len(paths) != 1 || paths[0] != "content/a.txt" {
 		t.Fatalf("unexpected paths: %v", paths)
 	}
 }

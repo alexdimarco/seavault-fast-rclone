@@ -284,7 +284,7 @@ func TestBrowserFolderUploadPreservesRelativePaths(t *testing.T) {
 	if code := getJSON(t, s, "/api/files", &files); code != http.StatusOK {
 		t.Fatalf("files failed: %d", code)
 	}
-	if len(files.Files) != 1 || files.Files[0].Path != "browser-root/folder/nested/a.txt" {
+	if len(files.Files) != 1 || files.Files[0].Path != "content/browser-root/folder/nested/a.txt" {
 		t.Fatalf("unexpected files: %#v", files.Files)
 	}
 }
@@ -319,7 +319,7 @@ func TestUploadPathUsesRsync(t *testing.T) {
 	if code := getJSON(t, s, "/api/files", &files); code != http.StatusOK {
 		t.Fatalf("files failed: %d", code)
 	}
-	if len(files.Files) != 1 || files.Files[0].Path != "local-rsync/nested/a.txt" {
+	if len(files.Files) != 1 || files.Files[0].Path != "content/local-rsync/nested/a.txt" {
 		t.Fatalf("unexpected files: %#v", files.Files)
 	}
 }
@@ -528,8 +528,8 @@ func TestIntegratedWebDAVFileManagerSmoke(t *testing.T) {
 	if rr.Code != 207 {
 		t.Fatalf("PROPFIND root failed: %d %s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "/docs/") {
-		t.Fatalf("PROPFIND root did not include docs folder: %s", rr.Body.String())
+	if !strings.Contains(rr.Body.String(), "/content/") {
+		t.Fatalf("PROPFIND root did not include content folder: %s", rr.Body.String())
 	}
 	rr = davRequest(t, s, "PROPFIND", "docs", nil, map[string]string{"Depth": "1"})
 	if rr.Code != 207 || !strings.Contains(rr.Body.String(), "a.txt") {

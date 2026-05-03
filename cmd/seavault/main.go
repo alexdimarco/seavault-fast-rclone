@@ -31,7 +31,7 @@ import (
 	"github.com/example/seavault-fast/internal/webui"
 )
 
-const version = "0.12.0"
+const version = "0.14.0"
 
 func main() {
 	if len(os.Args) < 2 {

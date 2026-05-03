@@ -155,7 +155,7 @@ func TestManifestConflictCopyIsPreserved(t *testing.T) {
 	if _, err := v.PutReader(strings.NewReader("version one"), "doc.txt", int64(len("version one")), 0o600, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	orig := firstManifestFile(t, root)
+	orig := firstManifestFile(t, root, v)
 	copyPath := strings.TrimSuffix(orig, ".manifest") + ".cloud-conflict.manifest"
 	copyFile(t, orig, copyPath)
 	if _, err := v.PutReader(strings.NewReader("version two"), "doc.txt", int64(len("version two")), 0o600, time.Now().Add(time.Second)); err != nil {
@@ -165,12 +165,12 @@ func TestManifestConflictCopyIsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := files["doc.txt"]; !ok {
+	if _, ok := files["content/doc.txt"]; !ok {
 		t.Fatalf("winning file missing: %#v", files)
 	}
 	foundConflict := false
 	for p, rec := range files {
-		if strings.HasPrefix(p, "doc.txt.conflict-") && rec.ConflictOf == "doc.txt" {
+		if strings.HasPrefix(p, "content/doc.txt.conflict-") && rec.ConflictOf == "content/doc.txt" {
 			foundConflict = true
 		}
 	}
@@ -190,7 +190,7 @@ func TestRemoveTombstoneWinsOverOlderConflictCopy(t *testing.T) {
 	if _, err := v.PutReader(strings.NewReader("old"), "doc.txt", 3, 0o600, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	orig := firstManifestFile(t, root)
+	orig := firstManifestFile(t, root, v)
 	copyPath := strings.TrimSuffix(orig, ".manifest") + ".old-sync-conflict.manifest"
 	copyFile(t, orig, copyPath)
 	if err := v.Remove("doc.txt"); err != nil {
@@ -201,13 +201,13 @@ func TestRemoveTombstoneWinsOverOlderConflictCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for p := range files {
-		if p == "doc.txt" || strings.HasPrefix(p, "doc.txt.conflict-") {
+		if p == "content/doc.txt" || strings.HasPrefix(p, "content/doc.txt.conflict-") {
 			t.Fatalf("older manifest should be suppressed by delete tombstone; files: %#v", files)
 		}
 	}
 }
 
-func firstManifestFile(t *testing.T, root string) string {
+func firstManifestFile(t *testing.T, root string, v *Vault) string {
 	t.Helper()
 	var found string
 	err := filepath.WalkDir(filepath.Join(root, MetadataDirName, ManifestDirName), func(p string, d os.DirEntry, err error) error {
@@ -215,7 +215,15 @@ func firstManifestFile(t *testing.T, root string) string {
 			return err
 		}
 		if !d.IsDir() && strings.HasSuffix(d.Name(), ".manifest") && found == "" {
-			found = p
+			data, readErr := os.ReadFile(p)
+			if readErr != nil {
+				return readErr
+			}
+			id := manifestIDFromFileName(d.Name())
+			rec, decErr := v.decryptManifest(data, id)
+			if decErr == nil && !IsInternalVirtualPath(rec.Path) {
+				found = p
+			}
 		}
 		return nil
 	})
@@ -370,7 +378,7 @@ func TestPutDirectoryContentsDoesNotIncludeSourceRootName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"archive/nested/one.txt", "archive/two.txt"}
+	want := []string{"content/archive/nested/one.txt", "content/archive/two.txt"}
 	if len(paths) != len(want) {
 		t.Fatalf("unexpected paths: got %#v want %#v", paths, want)
 	}
@@ -378,5 +386,48 @@ func TestPutDirectoryContentsDoesNotIncludeSourceRootName(t *testing.T) {
 		if paths[i] != want[i] {
 			t.Fatalf("unexpected paths: got %#v want %#v", paths, want)
 		}
+	}
+}
+
+func TestOpenMigratesLegacyRootFilesIntoContent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	password := "password"
+	createTestVault(t, root, password)
+	v, err := Open(root, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := v.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := v.putReader(strings.NewReader("legacy"), "docs/legacy.txt", 6, 0o600, time.Now(), &idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Path != "docs/legacy.txt" {
+		t.Fatalf("test setup expected legacy path, got %q", res.Path)
+	}
+	if err := v.saveFileManifest("docs/legacy.txt", idx.Files["docs/legacy.txt"]); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := Open(root, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := migrated.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != "content/docs/legacy.txt" {
+		t.Fatalf("legacy root file was not migrated into content/: %#v", paths)
+	}
+	var buf bytes.Buffer
+	if err := migrated.WriteFileTo("docs/legacy.txt", &buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "legacy" {
+		t.Fatalf("unexpected migrated content %q", buf.String())
 	}
 }

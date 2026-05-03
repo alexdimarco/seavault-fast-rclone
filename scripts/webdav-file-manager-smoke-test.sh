@@ -58,7 +58,7 @@ post_json /api/init "{\"vaultPath\":\"$VAULT\",\"password\":\"$PASSWORD\",\"kdf\
 
 printf 'webdav smoke\n' > "$WORK/a.txt"
 curl -fsS -T "$WORK/a.txt" -H "X-SeaVault-Token: $TOKEN" "$URL/dav/$TOKEN/docs/a.txt" >/dev/null
-curl -fsS -X PROPFIND -H 'Depth: 1' -H "X-SeaVault-Token: $TOKEN" "$URL/dav/$TOKEN/" | grep -q '/docs/'
+curl -fsS -X PROPFIND -H 'Depth: 1' -H "X-SeaVault-Token: $TOKEN" "$URL/dav/$TOKEN/" | grep -q '/content/'
 curl -fsS -X PROPFIND -H 'Depth: 1' -H "X-SeaVault-Token: $TOKEN" "$URL/dav/$TOKEN/docs/" | grep -q 'a.txt'
 curl -fsS -H "X-SeaVault-Token: $TOKEN" "$URL/dav/$TOKEN/docs/a.txt" | grep -q 'webdav smoke'
 curl -fsS -X COPY -H "Destination: /dav/$TOKEN/docs/b.txt" -H "X-SeaVault-Token: $TOKEN" "$URL/dav/$TOKEN/docs/a.txt" >/dev/null
