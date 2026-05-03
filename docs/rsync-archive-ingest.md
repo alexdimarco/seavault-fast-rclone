@@ -30,8 +30,10 @@ The cloud provider or remote transport still receives only encrypted `.seavault`
 
 The GUI supports two folder workflows:
 
-1. Browser folder upload. This uses `<input type="file" webkitdirectory>` where the browser supports it and preserves the browser-provided relative path.
-2. Local path ingest. The GUI server runs locally and can read a user-provided local file or folder path. This mode supports `auto`, `rsync`, and `native` put methods.
+1. Browser folder upload. This uses `<input type="file" webkitdirectory>` where the browser supports it and preserves the browser-provided relative path. The selected folder name is part of that relative path. If the selected folder is `Articles`, leave the virtual path blank or enter a parent folder such as `Archive`; do not also enter `Articles` unless `Articles/Articles/...` is intended.
+2. Local path ingest. The GUI server runs locally and can read a user-provided local file or folder path. This mode supports `auto`, `rsync`, and `native` put methods. It remains useful for very large folders because browser folder pickers do not expose the real local disk path to JavaScript or the local GUI server.
+
+The GUI displays selected-file and selected-folder summaries below the browser pickers. It also warns when the virtual path appears to duplicate the selected browser folder name. The rsync binary field is prefilled with the detected or usual rsync path for the current OS and can still be cleared to search `PATH`.
 
 ## Security notes
 

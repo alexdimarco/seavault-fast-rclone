@@ -7,16 +7,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
+	"github.com/example/seavault-fast/internal/rsyncbin"
 	"github.com/example/seavault-fast/internal/userpath"
 	"github.com/example/seavault-fast/internal/vault"
 )
 
 const (
-	MethodAuto   = "auto"
-	MethodRsync  = "rsync"
-	MethodNative = "native"
+	MethodAuto         = "auto"
+	MethodManagedRsync = "managed-rsync"
+	MethodSystemRsync  = "system-rsync"
+	MethodRsync        = "rsync" // backwards-compatible alias for system-rsync
+	MethodNative       = "native"
 )
 
 type Options struct {
@@ -33,51 +37,107 @@ type Result struct {
 }
 
 type Status struct {
-	Available bool   `json:"available"`
-	Binary    string `json:"binary,omitempty"`
-	Version   string `json:"version,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Available      bool            `json:"available"`
+	Binary         string          `json:"binary,omitempty"`
+	Version        string          `json:"version,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	DefaultHint    string          `json:"defaultHint,omitempty"`
+	Candidates     []string        `json:"candidates,omitempty"`
+	OS             string          `json:"os,omitempty"`
+	Managed        rsyncbin.Status `json:"managed"`
+	Recommended    string          `json:"recommended"`
+	NativeFallback bool            `json:"nativeFallback"`
 }
 
+// DefaultBinaryHint returns the most likely rsync executable path for this OS.
+// It prefers the managed rsync runtime, then an executable currently on PATH,
+// then common install locations.
+func DefaultBinaryHint() string { return rsyncbin.DefaultBinaryHint() }
+
+// CandidateBinaryPaths returns common rsync installation paths for user guidance.
+func CandidateBinaryPaths() []string { return rsyncbin.CandidateBinaryPaths() }
+
 func Inspect(ctx context.Context, binary string) Status {
-	bin, err := resolveBinary(binary)
+	managed := rsyncbin.NewInstaller().Status(ctx, false)
+	base := Status{DefaultHint: DefaultBinaryHint(), Candidates: CandidateBinaryPaths(), OS: runtime.GOOS, Managed: managed, NativeFallback: true, Recommended: "native"}
+	if managed.Installed && managed.RuntimeOK {
+		base.Available = true
+		base.Binary = managed.BinaryPath
+		base.Version = "rsync version " + managed.Version
+		base.Recommended = MethodManagedRsync
+		return base
+	}
+	bin, err := resolveSystemBinary(binary)
 	if err != nil {
-		return Status{Available: false, Error: err.Error()}
+		base.Error = err.Error()
+		return base
 	}
 	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+	base.Binary = bin
 	if err != nil {
-		return Status{Available: false, Binary: bin, Error: strings.TrimSpace(string(out))}
+		base.Error = strings.TrimSpace(string(out))
+		return base
 	}
-	return Status{Available: true, Binary: bin, Version: firstLine(string(out))}
+	base.Available = true
+	base.Version = firstLine(string(out))
+	base.Recommended = MethodSystemRsync
+	return base
 }
 
 func PutPath(ctx context.Context, v *vault.Vault, sourcePath string, virtualPath string, opts Options) (Result, error) {
-	method := strings.ToLower(strings.TrimSpace(opts.Method))
-	if method == "" {
-		method = MethodAuto
-	}
+	originalMethod := strings.ToLower(strings.TrimSpace(opts.Method))
+	method := normalizeMethod(opts.Method)
 	switch method {
 	case MethodNative:
 		results, err := v.PutPath(sourcePath, virtualPath)
 		return Result{Method: MethodNative, Results: results}, err
-	case MethodRsync:
-		return putViaRsync(ctx, v, sourcePath, virtualPath, opts)
-	case MethodAuto:
-		if _, err := resolveBinary(opts.RsyncBinary); err != nil {
-			results, putErr := v.PutPath(sourcePath, virtualPath)
-			return Result{Method: MethodNative, Results: results}, putErr
+	case MethodManagedRsync:
+		bin, err := rsyncbin.BinaryPath()
+		if err != nil {
+			return Result{}, err
 		}
-		return putViaRsync(ctx, v, sourcePath, virtualPath, opts)
+		return putViaRsync(ctx, v, sourcePath, virtualPath, opts, bin, MethodManagedRsync)
+	case MethodSystemRsync:
+		bin, err := resolveSystemBinary(opts.RsyncBinary)
+		if err != nil {
+			return Result{}, err
+		}
+		label := MethodSystemRsync
+		if originalMethod == MethodRsync {
+			label = MethodRsync
+		}
+		return putViaRsync(ctx, v, sourcePath, virtualPath, opts, bin, label)
+	case MethodAuto:
+		if bin, err := rsyncbin.BinaryPath(); err == nil {
+			return putViaRsync(ctx, v, sourcePath, virtualPath, opts, bin, MethodManagedRsync)
+		}
+		if bin, err := resolveSystemBinary(opts.RsyncBinary); err == nil {
+			return putViaRsync(ctx, v, sourcePath, virtualPath, opts, bin, MethodSystemRsync)
+		}
+		results, putErr := v.PutPath(sourcePath, virtualPath)
+		return Result{Method: MethodNative, Results: results}, putErr
 	default:
-		return Result{}, fmt.Errorf("unsupported put method %q; use auto, rsync, or native", opts.Method)
+		return Result{}, fmt.Errorf("unsupported put method %q; use auto, native, managed-rsync, system-rsync, or rsync", opts.Method)
 	}
 }
 
-func putViaRsync(ctx context.Context, v *vault.Vault, sourcePath string, virtualPath string, opts Options) (Result, error) {
-	bin, err := resolveBinary(opts.RsyncBinary)
-	if err != nil {
-		return Result{}, err
+func normalizeMethod(method string) string {
+	method = strings.ToLower(strings.TrimSpace(method))
+	switch method {
+	case "", MethodAuto:
+		return MethodAuto
+	case MethodNative:
+		return MethodNative
+	case MethodManagedRsync, "managed", "app-rsync":
+		return MethodManagedRsync
+	case MethodSystemRsync, MethodRsync, "system":
+		return MethodSystemRsync
+	default:
+		return method
 	}
+}
+
+func putViaRsync(ctx context.Context, v *vault.Vault, sourcePath string, virtualPath string, opts Options, bin string, method string) (Result, error) {
 	src, err := userpath.Abs(sourcePath)
 	if err != nil {
 		return Result{}, err
@@ -108,25 +168,22 @@ func putViaRsync(ctx context.Context, v *vault.Vault, sourcePath string, virtual
 	outBytes, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(outBytes))
 	if err != nil {
-		return Result{Method: MethodRsync, RsyncBinary: bin, RsyncOutput: out}, fmt.Errorf("rsync staging failed: %w: %s", err, out)
+		return Result{Method: method, RsyncBinary: bin, RsyncOutput: out}, fmt.Errorf("rsync staging failed: %w: %s", err, out)
 	}
 
 	staged := filepath.Join(tmp, filepath.Base(src))
 	if _, err := os.Stat(staged); err != nil {
-		// Some rsync builds treat a file destination differently. This keeps the
-		// failure explicit rather than falling back to native ingest after a partial
-		// staging run.
 		kind := "file"
 		if info.IsDir() {
 			kind = "directory"
 		}
-		return Result{Method: MethodRsync, RsyncBinary: bin, RsyncOutput: out}, fmt.Errorf("rsync staged %s was not found at %s", kind, staged)
+		return Result{Method: method, RsyncBinary: bin, RsyncOutput: out}, fmt.Errorf("rsync staged %s was not found at %s", kind, staged)
 	}
 	results, err := v.PutPath(staged, virtualPath)
-	return Result{Method: MethodRsync, RsyncBinary: bin, RsyncOutput: out, Results: results}, err
+	return Result{Method: method, RsyncBinary: bin, RsyncOutput: out, Results: results}, err
 }
 
-func resolveBinary(binary string) (string, error) {
+func resolveSystemBinary(binary string) (string, error) {
 	binary = strings.TrimSpace(binary)
 	if binary == "" {
 		binary = "rsync"
@@ -145,7 +202,7 @@ func resolveBinary(binary string) (string, error) {
 	}
 	p, err := exec.LookPath(binary)
 	if err != nil {
-		return "", fmt.Errorf("rsync was not found; install rsync or use --method native")
+		return "", fmt.Errorf("system rsync was not found; use --method native or install managed rsync")
 	}
 	return p, nil
 }

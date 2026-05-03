@@ -19,6 +19,7 @@ import (
 	"github.com/example/seavault-fast/internal/profile"
 	"github.com/example/seavault-fast/internal/rclonebin"
 	"github.com/example/seavault-fast/internal/remotes"
+	"github.com/example/seavault-fast/internal/rsyncbin"
 	"github.com/example/seavault-fast/internal/rsyncput"
 	"github.com/example/seavault-fast/internal/sshkeys"
 	"github.com/example/seavault-fast/internal/transport"
@@ -29,7 +30,7 @@ import (
 	"github.com/example/seavault-fast/internal/webui"
 )
 
-const version = "0.8.0"
+const version = "0.11.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -155,13 +156,13 @@ func cmdInit(args []string) error {
 func cmdPut(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ExitOnError)
 	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
-	method := fs.String("method", "auto", "put method: auto, rsync, or native; auto prefers rsync when available")
-	rsyncBinary := fs.String("rsync", "", "rsync binary path or name; default searches PATH")
+	method := fs.String("method", "auto", "put method: auto, native, managed-rsync, system-rsync, or rsync; auto prefers managed rsync, then system rsync, then native")
+	rsyncBinary := fs.String("rsync", "", "system rsync binary path or name; ignored by managed-rsync")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 2 || fs.NArg() > 3 {
-		return fmt.Errorf("usage: seavault put [--no-keychain] [--method auto|rsync|native] [--rsync PATH] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
+		return fmt.Errorf("usage: seavault put [--no-keychain] [--method auto|native|managed-rsync|system-rsync|rsync] [--rsync PATH] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
 	}
 	vaultPath, err := resolveVaultArg(fs.Arg(0))
 	if err != nil {
@@ -607,16 +608,86 @@ func cmdKeychain(args []string) error {
 
 func cmdRsync(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: seavault rsync status [--binary PATH]")
+		return fmt.Errorf("usage: seavault rsync status|install|check-update|update|rollback|verify-runtime|path")
 	}
+	ctx := context.Background()
+	installer := rsyncbin.NewInstaller()
 	switch args[0] {
 	case "status":
 		fs := flag.NewFlagSet("rsync status", flag.ExitOnError)
-		binary := fs.String("binary", "", "rsync binary path or name; default searches PATH")
+		binary := fs.String("binary", "", "system rsync binary path or name; default searches PATH after managed rsync")
+		check := fs.Bool("check-update", false, "also check latest upstream rsync source release")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		return printJSON(rsyncput.Inspect(context.Background(), *binary))
+		st := rsyncput.Inspect(ctx, *binary)
+		if *check {
+			st.Managed = installer.Status(ctx, true)
+		}
+		return printJSON(st)
+	case "install":
+		fs := flag.NewFlagSet("rsync install", flag.ExitOnError)
+		ver := fs.String("version", "", "rsync version to register/install; default latest source release for runtime archive URLs")
+		fromBinary := fs.String("from-binary", "", "register/copy an existing rsync-compatible binary into the managed runtime")
+		offlineArchive := fs.String("offline-archive", "", "install from a local SeaVault rsync runtime zip archive")
+		offlineSHA := fs.String("offline-sha256sums", "", "SHA256SUMS file for --offline-archive")
+		runtimeBase := fs.String("runtime-base-url", "", "base URL for SeaVault-built rsync runtime artifacts")
+		buildID := fs.String("build-id", "", "optional runtime build identifier for provenance")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		m, err := installer.Install(ctx, rsyncbin.InstallOptions{Version: *ver, FromBinary: *fromBinary, OfflineArchive: *offlineArchive, OfflineSHA256: *offlineSHA, RuntimeBaseURL: *runtimeBase, BuildID: *buildID})
+		if printErr := printJSON(m); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "check-update":
+		li, err := installer.Latest(ctx)
+		if printErr := printJSON(li); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "update":
+		fs := flag.NewFlagSet("rsync update", flag.ExitOnError)
+		ver := fs.String("version", "", "rsync version to install; default latest upstream source release")
+		fromBinary := fs.String("from-binary", "", "register/copy an existing rsync-compatible binary into the managed runtime")
+		offlineArchive := fs.String("offline-archive", "", "install from a local SeaVault rsync runtime zip archive")
+		offlineSHA := fs.String("offline-sha256sums", "", "SHA256SUMS file for --offline-archive")
+		runtimeBase := fs.String("runtime-base-url", "", "base URL for SeaVault-built rsync runtime artifacts")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		m, err := installer.Update(ctx, rsyncbin.InstallOptions{Version: *ver, FromBinary: *fromBinary, OfflineArchive: *offlineArchive, OfflineSHA256: *offlineSHA, RuntimeBaseURL: *runtimeBase})
+		if printErr := printJSON(m); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "rollback":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: seavault rsync rollback")
+		}
+		m, err := rsyncbin.Rollback()
+		if printErr := printJSON(m); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "verify-runtime":
+		m, err := rsyncbin.LoadManifest()
+		if err == nil {
+			err = rsyncbin.VerifyRuntime(m)
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Println("managed rsync runtime verified")
+		return nil
+	case "path":
+		bin, err := rsyncbin.BinaryPath()
+		if err != nil {
+			return err
+		}
+		fmt.Println(bin)
+		return nil
 	default:
 		return fmt.Errorf("unknown rsync command %q", args[0])
 	}
@@ -1066,7 +1137,7 @@ Cloud-folder client-side encrypted storage.
 
 Usage:
   seavault init [flags] VAULT_DIR
-  seavault put [--method auto|rsync|native] [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
+  seavault put [--method auto|native|managed-rsync|system-rsync|rsync] [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
   seavault get [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_PATH
   seavault export [--overwrite fail|skip|replace] [--zip] [--dry-run] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_LOCAL_FOLDER_OR_ZIP
   seavault list [flags] VAULT_DIR_OR_PROFILE
@@ -1084,7 +1155,7 @@ Usage:
   seavault keychain status VAULT_DIR_OR_PROFILE
   seavault keychain delete VAULT_DIR_OR_PROFILE
   seavault rclone status | install | check-update | update | rollback | verify-runtime
-  seavault rsync status [--binary PATH]
+  seavault rsync status | install | check-update | update | rollback | verify-runtime | path
   seavault remote add NAME VAULT_DIR_OR_PROFILE RCLONE_REMOTE_PATH
   seavault remote list | show NAME | test NAME | dry-run NAME | push NAME | pull NAME | check NAME
   seavault ssh-key generate NAME | list | public NAME | import NAME PRIVATE_KEY

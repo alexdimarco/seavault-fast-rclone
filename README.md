@@ -4,6 +4,27 @@ SeaVault Fast is a cross-platform prototype for client-side encrypted storage. I
 
 This repository is a working MVP, not an audited production replacement for Cryptomator.
 
+
+## What changed in v0.11
+
+- Added optional app-managed rsync runtime support. SeaVault now has managed tool controls for both rclone and rsync.
+- Kept native Go ingest as the default dependency-free local import path.
+- Added put methods: `native`, `managed-rsync`, `system-rsync`, `rsync`, and `auto`.
+- `auto` now tries managed rsync first, then system rsync, then native import.
+- Added CLI commands for managed rsync status, install/register, source update check, update, rollback, verification, and path discovery.
+- Added GUI controls to register an existing rsync binary, install an offline SeaVault rsync runtime archive, check latest upstream source release, update, and rollback.
+- Added runtime manifest tracking for managed rsync: version, source version, source URL, binary path, SHA256, install time, previous runtime, and runtime verification status.
+- Added documentation for managed rsync, source/provenance handling, and native-vs-rsync ingest choices.
+
+## What changed in v0.9
+
+- Improved the GUI upload panel guidance for browser folder uploads. The virtual path help now states that browser folder selection already includes the selected folder name.
+- Added visible selected-file and selected-folder summaries because browser file inputs often show only truncated names.
+- Added a duplicate-folder warning when the virtual path ends with the same name as the selected browser folder.
+- Prefilled the rsync binary override with the detected or usual rsync path for the current OS.
+- Renamed the local path action to `Import local path` and added clearer messages when no local path is typed. This advanced path remains useful for very large local folders because browsers cannot expose a selected folder's real disk path.
+- Extended rsync status output with OS, default hint, and candidate paths.
+
 ## What changed in v0.8
 
 - Added saved-vault selection in the GUI with a dropdown for multiple vault locations.
@@ -56,25 +77,30 @@ The provider sees only `.seavault/vault.json`, encrypted chunk objects, encrypte
 
 ## Rsync-assisted archive ingest
 
-The `put` command now defaults to `--method auto`, which prefers rsync when rsync is available on the machine and falls back to native ingest when rsync is missing. Use `--method rsync` when rsync must be required, or `--method native` to bypass rsync staging.
+The `put` command now defaults to `--method auto`, which tries the app-managed rsync runtime when installed and verified, then system rsync, then native Go ingest. Native Go ingest remains the dependency-free default in the GUI and the safest fallback. Use `--method managed-rsync` to require the managed runtime, `--method system-rsync` or `--method rsync` to require a system binary, or `--method native` to bypass rsync staging.
 
 ```bash
-# Prefer rsync, fall back to native only when rsync is missing
+# Try managed rsync, then system rsync, then native Go import
 seavault put --method auto nextcloud ./folder archive/folder
 
-# Require rsync
-seavault put --method rsync nextcloud ./folder archive/folder
+# Dependency-free local import
+seavault put --method native nextcloud ./folder archive/folder
 
-# Override rsync binary path
-seavault put --method rsync --rsync /usr/bin/rsync nextcloud ./folder archive/folder
+# Require the app-managed rsync runtime
+seavault put --method managed-rsync nextcloud ./folder archive/folder
+
+# Require system rsync and optionally override the binary path
+seavault put --method system-rsync --rsync /usr/bin/rsync nextcloud ./folder archive/folder
 ```
 
 Rsync is used only as a local staging/enumeration helper for ingest. It does not write plaintext into `.seavault`; the app encrypts staged files into content-defined chunks and encrypted manifests. The temporary staging directory is deleted after ingest unless debugging options are added in development builds.
 
 The GUI now has two folder options:
 
-- Browser folder upload, using the browser-provided relative file paths where supported.
-- Local path upload, where the local GUI server reads a file or folder path from this computer and uses rsync-assisted ingest.
+- Browser folder upload, using the browser-provided relative file paths where supported. The selected folder name is already included in those relative paths. For example, selecting a folder named `Articles` and entering `Archive` stores files under `Archive/Articles/...`; entering `Articles` stores files under `Articles/Articles/...`.
+- Local path ingest, where the local GUI server reads a typed file or folder path from this computer and uses rsync-assisted ingest. This is advanced but not redundant: browsers intentionally do not reveal the real local disk path of a selected folder, so local path ingest is the safer option for very large folders or scripted desktop workflows.
+
+The GUI shows a selected-file or selected-folder summary below each picker and warns when the virtual path appears to duplicate the selected folder name.
 
 
 ## Bulk export
@@ -96,6 +122,38 @@ seavault export --zip nextcloud projects/site ~/Desktop
 ```
 
 Overwrite policies are `fail`, `skip`, and `replace`. The GUI exposes the same controls with progress and cancel support.
+
+## Managed rsync runtime
+
+Managed rsync is optional. The app works without rsync because native Go ingest remains available. Managed rsync is useful when you want predictable local staging behaviour without asking users to install rsync manually. It is not the remote cloud transport; rclone remains the primary remote transport.
+
+```bash
+# Show managed/system rsync status and recommended ingest mode
+seavault rsync status --check-update
+
+# Register an existing verified rsync binary into SeaVault's managed runtime
+seavault rsync install --from-binary /usr/bin/rsync
+
+# Install an enterprise-built SeaVault rsync runtime archive
+seavault rsync install --offline-archive ./seavault-rsync-3.4.2-linux-amd64.zip
+
+# Update, rollback, verify, and show active path
+seavault rsync check-update
+seavault rsync update --offline-archive ./seavault-rsync-3.4.2-linux-amd64.zip
+seavault rsync rollback
+seavault rsync verify-runtime
+seavault rsync path
+```
+
+Runtime locations:
+
+| OS | Location |
+|---|---|
+| Linux | `~/.local/share/seavault/rsync` |
+| macOS | `~/Library/Application Support/SeaVault/rsync` |
+| Windows | `%LOCALAPPDATA%\SeaVault\rsync` |
+
+Rsync upstream is source-first. SeaVault therefore supports a source-direct provenance model: track the upstream rsync source release, verify or register an enterprise-built runtime artifact, record the binary hash, and retain the previous version for rollback. A direct binary update channel should be operated by the project or an enterprise administrator, not by downloading arbitrary third-party rsync binaries.
 
 ## Rclone transport model
 
@@ -165,7 +223,7 @@ Remote profile configuration is stored outside the vault. Rclone config is store
 seavault gui
 ```
 
-The GUI listens on `127.0.0.1:8787` by default. It provides vault create/open/upload/download/delete/verify workflows, batched browser folder upload, rsync-assisted local path ingest, bulk export, optional ZIP export, profile management, managed rclone runtime controls, remote repository profiles, transfer actions, and SSH key management.
+The GUI listens on `127.0.0.1:8787` by default. It provides vault create/open/upload/download/delete/verify workflows, batched browser folder upload, rsync-assisted local path ingest, bulk export, optional ZIP export, profile management, managed rsync and rclone runtime controls, remote repository profiles, transfer actions, and SSH key management.
 
 The desktop layout keeps the result/progress panel on the right. Narrower tablet and phone layouts collapse to one column so controls remain readable and tables do not force horizontal page scrolling. Browser folder upload is capability-detected; when a browser does not expose folder selection, use local path ingest for directory imports.
 
@@ -175,10 +233,10 @@ Do not bind the GUI to a public or shared network interface.
 
 ```bash
 seavault init [flags] VAULT_DIR
-seavault put [--method auto|rsync|native] [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
+seavault put [--method auto|native|managed-rsync|system-rsync|rsync] [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
 seavault get [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_PATH
 seavault export [--overwrite fail|skip|replace] [--zip] [--dry-run] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_LOCAL_FOLDER_OR_ZIP
-seavault rsync status [--binary PATH]
+seavault rsync status|install|check-update|update|rollback|verify-runtime|path
 seavault list [flags] VAULT_DIR_OR_PROFILE
 seavault remove [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH
 seavault verify [flags] VAULT_DIR_OR_PROFILE
@@ -232,7 +290,7 @@ GOOS=windows GOARCH=amd64 go build -o dist/seavault-windows-amd64.exe ./cmd/seav
 - Linux keychain support requires a Secret Service provider and `secret-tool`.
 - GPG signature verification for rclone downloads depends on a locally available `gpg` binary.
 - SSH key passphrase storage, host-key pinning UI, and SSH-agent GUI integration are still production-hardening items.
-- Rsync-assisted ingest requires rsync for strict `--method rsync`; `--method auto` falls back to native ingest when rsync is missing.
+- Managed rsync is optional. `--method auto` falls back to native ingest when managed/system rsync is unavailable; strict rsync modes require either a verified managed runtime or a system binary.
 - Native mount integrations are not included; `serve` provides a minimal WebDAV-compatible local endpoint.
 - Multi-device concurrent edits are preserved as conflict copies, but the app does not merge application-level document contents.
 - Password rotation, recovery keys, signed release pipelines, installer packages, and full admin policy enforcement are still future work.

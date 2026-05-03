@@ -69,6 +69,12 @@ func TestIndexUsesResponsiveCrossBrowserLayout(t *testing.T) {
 		`id="availableVaults"`,
 		`Save vault location/password`,
 		`webkitdirectory directory multiple`,
+		`selected folder name is already included`,
+		`id="fileSummary"`,
+		`id="folderSummary"`,
+		`Import local path`,
+		`Browser-selected folders cannot fill this field`,
+		`value="`,
 		`The browser could not reach the local SeaVault GUI service`,
 	}
 	for _, want := range checks {
@@ -421,5 +427,8 @@ func TestRsyncStatusAPI(t *testing.T) {
 	}
 	if available, _ := st["available"].(bool); available {
 		t.Fatalf("expected fake rsync to be unavailable: %#v", st)
+	}
+	if st["defaultHint"] == "" || st["os"] == "" {
+		t.Fatalf("expected rsync status to include OS/default hint: %#v", st)
 	}
 }

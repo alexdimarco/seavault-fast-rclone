@@ -338,3 +338,45 @@ func assertFileString(t *testing.T, path, want string) {
 		t.Fatalf("%s = %q, want %q", path, string(got), want)
 	}
 }
+
+func TestPutDirectoryContentsDoesNotIncludeSourceRootName(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	password := "password"
+	createTestVault(t, root, password)
+
+	src := filepath.Join(t.TempDir(), "Articles")
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "nested", "one.txt"), []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "two.txt"), []byte("two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := Open(root, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := v.PutDirectoryContents(src, "archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 imported files, got %#v", results)
+	}
+	paths, err := v.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"archive/nested/one.txt", "archive/two.txt"}
+	if len(paths) != len(want) {
+		t.Fatalf("unexpected paths: got %#v want %#v", paths, want)
+	}
+	for i := range want {
+		if paths[i] != want[i] {
+			t.Fatalf("unexpected paths: got %#v want %#v", paths, want)
+		}
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"github.com/example/seavault-fast/internal/profile"
 	"github.com/example/seavault-fast/internal/rclonebin"
 	"github.com/example/seavault-fast/internal/remotes"
+	"github.com/example/seavault-fast/internal/rsyncbin"
 	"github.com/example/seavault-fast/internal/rsyncput"
 	"github.com/example/seavault-fast/internal/sshkeys"
 	"github.com/example/seavault-fast/internal/transport"
@@ -85,6 +86,15 @@ type rcloneInstallRequest struct {
 	OfflineArchive string `json:"offlineArchive"`
 	OfflineSHA256  string `json:"offlineSHA256"`
 	Signature      string `json:"signature"`
+}
+
+type rsyncInstallRequest struct {
+	Version        string `json:"version"`
+	FromBinary     string `json:"fromBinary"`
+	OfflineArchive string `json:"offlineArchive"`
+	OfflineSHA256  string `json:"offlineSHA256"`
+	RuntimeBaseURL string `json:"runtimeBaseURL"`
+	BuildID        string `json:"buildID"`
 }
 
 type remoteRequest struct {
@@ -241,6 +251,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRcloneStatus(w, r)
 	case "/api/rsync/status":
 		s.handleRsyncStatus(w, r)
+	case "/api/rsync/install":
+		s.handleRsyncInstall(w, r)
+	case "/api/rsync/update":
+		s.handleRsyncUpdate(w, r)
+	case "/api/rsync/rollback":
+		s.handleRsyncRollback(w, r)
 	case "/api/rclone/install":
 		s.handleRcloneInstall(w, r)
 	case "/api/rclone/update":
@@ -268,7 +284,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Token          string
 		InitialPath    string
 		SuggestedPaths []string
-	}{Token: s.token, InitialPath: s.vaultPath, SuggestedPaths: userpath.SuggestedVaultPaths()})
+		RsyncHint      string
+	}{Token: s.token, InitialPath: s.vaultPath, SuggestedPaths: userpath.SuggestedVaultPaths(), RsyncHint: rsyncput.DefaultBinaryHint()})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -711,7 +728,58 @@ func (s *Server) handleRsyncStatus(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, rsyncput.Inspect(r.Context(), r.URL.Query().Get("binary")))
+	st := rsyncput.Inspect(r.Context(), r.URL.Query().Get("binary"))
+	if r.URL.Query().Get("checkUpdate") == "1" || strings.EqualFold(r.URL.Query().Get("checkUpdate"), "true") {
+		st.Managed = rsyncbin.NewInstaller().Status(r.Context(), true)
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleRsyncInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req rsyncInstallRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	m, err := rsyncbin.NewInstaller().Install(r.Context(), rsyncbin.InstallOptions{Version: req.Version, FromBinary: req.FromBinary, OfflineArchive: req.OfflineArchive, OfflineSHA256: req.OfflineSHA256, RuntimeBaseURL: req.RuntimeBaseURL, BuildID: req.BuildID})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "manifest": m})
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (s *Server) handleRsyncUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req rsyncInstallRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	m, err := rsyncbin.NewInstaller().Update(r.Context(), rsyncbin.InstallOptions{Version: req.Version, FromBinary: req.FromBinary, OfflineArchive: req.OfflineArchive, OfflineSHA256: req.OfflineSHA256, RuntimeBaseURL: req.RuntimeBaseURL, BuildID: req.BuildID})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "manifest": m})
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (s *Server) handleRsyncRollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	m, err := rsyncbin.Rollback()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
 }
 
 func (s *Server) handleRcloneStatus(w http.ResponseWriter, r *http.Request) {
@@ -1195,6 +1263,8 @@ button.danger { border-color: var(--danger); background: var(--danger-bg); color
 button.secondary { background: var(--panel-2); border-color: var(--border); }
 button:disabled, body.busy button.operation { opacity: .55; cursor: not-allowed; }
 small, .hint { color: var(--muted); }
+.selection-summary { display: block; min-height: 2.4em; overflow-wrap: anywhere; }
+.selection-summary.warning { color: var(--danger); }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; padding: 12px; border-radius: 12px; background: var(--panel-2); border: 1px solid var(--border); }
 #status { min-height: 280px; }
 #message { padding: 10px 12px; border-radius: 12px; background: var(--panel-2); border: 1px solid var(--border); margin-bottom: 12px; }
@@ -1249,6 +1319,7 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
     <a href="#export-panel">Export</a>
     <a href="#files-panel">Files</a>
     <a href="#remote-panel">Remote</a>
+    <a href="#managed-tools-panel">Managed tools</a>
     <a href="#keys-panel">SSH keys</a>
   </nav>
   <div id="compatWarning" class="compat-warning" role="alert"></div>
@@ -1303,41 +1374,44 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 
 <section id="upload-panel">
   <h2>Upload into encrypted archive</h2>
-  <p class="hint">Browser uploads are encrypted directly into the vault. For very large folders, the GUI sends smaller batches. Local path ingest lets the local GUI server read the folder directly and can use rsync-assisted staging.</p>
+  <p class="hint">Browser uploads are encrypted directly into the vault. For very large folders, the GUI sends smaller batches. Local path ingest lets the local GUI server read the folder directly. It uses native Go import by default, or optional managed/system rsync staging when selected.</p>
   <div class="form-grid">
     <label>Virtual path or folder
       <input id="uploadPath" placeholder="reports/" autocomplete="off">
-      <small>For one file, use an exact path such as reports/a.pdf. For folders, use a folder prefix such as reports/.</small>
+      <small id="uploadPathHint">For one file, use an exact path such as reports/a.pdf. For selected browser folders, the selected folder name is already included in the upload path, so leave this blank or enter only the parent folder to avoid duplicate names.</small>
     </label>
     <label>Files from browser
       <input id="fileInput" type="file" multiple>
-      <small>Best for selected files.</small>
+      <small id="fileSummary" class="selection-summary">No browser files selected.</small>
     </label>
     <label>Folder from browser
       <input id="folderInput" type="file" webkitdirectory directory multiple>
       <small id="folderSupportHint">Preserves relative paths where the browser supports folder selection.</small>
+      <small id="folderSummary" class="selection-summary">No browser folder selected.</small>
     </label>
-    <label>Local file or folder path for rsync-assisted ingest
+    <label>Import from local path (advanced)
       <input id="localSourcePath" placeholder="~/Documents/project-folder" autocomplete="off">
-      <small>The local GUI server reads this path and encrypts it into the vault.</small>
+      <small>Optional. Type a local file or folder path only when you want the local GUI service to read it directly. Browser-selected folders cannot fill this field for security reasons.</small>
     </label>
     <label>Put method for local path ingest
       <select id="localPutMethod">
-        <option value="auto">auto: prefer rsync, fall back to native</option>
-        <option value="rsync">rsync: require rsync</option>
-        <option value="native">native: no rsync staging</option>
+        <option value="auto">auto: managed rsync, system rsync, then native</option>
+        <option value="native" selected>native: no rsync dependency</option>
+        <option value="managed-rsync">managed rsync: use app-managed runtime</option>
+        <option value="system-rsync">system rsync: use PATH or override</option>
+        <option value="rsync">rsync alias: require system rsync</option>
       </select>
-      <small>This setting does not apply to browser file/folder uploads.</small>
+      <small>This setting only applies to the local path field, not browser file/folder uploads. Native is recommended unless you specifically need rsync staging.</small>
     </label>
     <label>Rsync binary override
-      <input id="localRsyncBinary" placeholder="optional path or command name" autocomplete="off">
-      <small>Leave blank to search PATH for rsync.</small>
+      <input id="localRsyncBinary" value="{{.RsyncHint}}" placeholder="{{.RsyncHint}}" autocomplete="off">
+      <small>Used only for system-rsync. Managed rsync uses the app-managed runtime path.</small>
     </label>
   </div>
   <p class="row-actions">
     <button class="operation" onclick="uploadFiles('fileInput', false)">Upload selected files</button>
     <button class="operation" onclick="uploadFiles('folderInput', true)">Upload selected browser folder</button>
-    <button class="operation" onclick="uploadLocalPath()">Upload local path with rsync/auto</button>
+    <button class="operation" onclick="uploadLocalPath()">Import local path</button>
     <button class="secondary" onclick="checkRsync()">Check rsync</button>
     <button class="danger" onclick="cancelActive()">Cancel active upload/export</button>
   </p>
@@ -1386,6 +1460,36 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <p class="hint">These locations appear in the vault dropdown. Passwords are only stored when you save them to the OS keychain.</p>
   <p><button onclick="refreshStatus()">Refresh saved vaults</button></p>
   <div id="profiles" class="table-wrap"></div>
+</section>
+
+<section id="managed-tools-panel">
+  <h2>Managed rsync runtime</h2>
+  <p class="hint">Managed rsync is optional. SeaVault works without it by using native Go import. Installing managed rsync only affects local path ingest, not browser uploads or rclone remote transport.</p>
+  <div class="form-grid">
+    <label>Version
+      <input id="rsyncVersion" placeholder="latest upstream source release or 3.4.2" autocomplete="off">
+      <small>Leave blank for latest source release when using a runtime URL.</small>
+    </label>
+    <label>Register existing rsync binary
+      <input id="rsyncFromBinary" placeholder="/usr/bin/rsync" autocomplete="off">
+      <small>Copies a verified existing rsync into SeaVault's managed runtime folder.</small>
+    </label>
+    <label>Offline runtime ZIP
+      <input id="rsyncOfflineArchive" placeholder="/path/to/seavault-rsync-runtime.zip" autocomplete="off">
+      <small>Use an enterprise-built SeaVault rsync runtime archive.</small>
+    </label>
+    <label>Runtime base URL
+      <input id="rsyncRuntimeBaseURL" placeholder="optional enterprise runtime URL" autocomplete="off">
+      <small>Advanced. Direct upstream rsync is source-first, so binary runtime artifacts should come from a controlled SeaVault build channel.</small>
+    </label>
+  </div>
+  <p class="row-actions">
+    <button onclick="rsyncStatus(true)">Status and source update check</button>
+    <button class="operation" onclick="rsyncInstall()">Install/register managed rsync</button>
+    <button class="operation" onclick="rsyncUpdate()">Update managed rsync</button>
+    <button onclick="rsyncRollback()">Rollback managed rsync</button>
+  </p>
+  <pre id="rsyncStatus">No managed rsync status loaded.</pre>
 </section>
 
 <section>
@@ -1570,11 +1674,54 @@ async function saveCurrentVaultProfile(){
 async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
 async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
 async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshStatus(); } catch(e){ showError('Could not close vault', e.message); } }
+function fileSizeTotal(files){ return Array.from(files || []).reduce((n,f)=>n+(f.size||0),0); }
+function commonFolderRoot(files){
+  for(const f of Array.from(files || [])){
+    const rel = f.webkitRelativePath || '';
+    if(rel && rel.indexOf('/') > 0) return rel.split('/')[0];
+  }
+  return '';
+}
+function summarizeNames(files, preserveFolders){
+  const arr = Array.from(files || []);
+  if(arr.length === 0) return 'No ' + (preserveFolders ? 'browser folder' : 'browser files') + ' selected.';
+  const total = fmtBytes(fileSizeTotal(arr));
+  if(preserveFolders){
+    const root = commonFolderRoot(arr);
+    const sample = arr.slice(0,3).map(f => f.webkitRelativePath || f.name).join(', ');
+    return 'Selected folder ' + (root ? '"' + root + '" with ' : 'with ') + arr.length + ' file(s), ' + total + '. Sample: ' + sample + (arr.length > 3 ? ', ...' : '');
+  }
+  const sample = arr.slice(0,3).map(f => f.name).join(', ');
+  return 'Selected ' + arr.length + ' file(s), ' + total + '. ' + sample + (arr.length > 3 ? ', ...' : '');
+}
+function updateUploadSelectionSummaries(){
+  const fileInput = $('fileInput');
+  const folderInput = $('folderInput');
+  if(fileInput && $('fileSummary')) $('fileSummary').textContent = summarizeNames(fileInput.files, false);
+  if(folderInput && $('folderSummary')){
+    const root = commonFolderRoot(folderInput.files);
+    let text = summarizeNames(folderInput.files, true);
+    const prefix = $('uploadPath').value.trim().replace(/^\/+|\/+$/g, '');
+    const box = $('folderSummary');
+    box.className = 'selection-summary';
+    if(root && prefix && prefix.toLowerCase().split('/').pop() === root.toLowerCase()){
+      text += ' Warning: the virtual path ends with the same folder name. Use blank or a parent path if you do not want ' + root + '/' + root + '/... in the vault.';
+      box.className = 'selection-summary warning';
+    }
+    box.textContent = text;
+  }
+}
+function requireLocalSourcePath(){
+  const p = $('localSourcePath').value.trim();
+  if(p) return p;
+  showError('Local path required', 'Enter a local file or folder path in the Import from local path field first. Browser-selected folders do not expose their full local disk path to the app. Use Upload selected browser folder for browser picks, or type a path such as ~/Documents/project-folder for server-side rsync/native import.');
+  return '';
+}
 async function uploadFiles(inputId, preserveFolders){
   const input = $(inputId);
   let ctl;
   try {
-    if(!input.files || input.files.length === 0){ showError('Nothing selected', 'Select one or more files first.'); return; }
+    if(!input.files || input.files.length === 0){ showError('Nothing selected', preserveFolders ? 'Choose a browser folder first. The selected folder name is preserved automatically.' : 'Select one or more browser files first.'); return; }
     const files = Array.from(input.files);
     const batchSize = preserveFolders ? 40 : 80;
     const batches = [];
@@ -1599,6 +1746,7 @@ async function uploadFiles(inputId, preserveFolders){
     }
     const summary = {method:'browser-batched', results:allResults};
     input.value='';
+    updateUploadSelectionSummaries();
     endOperation('Upload complete.');
     showHuman('Upload complete', summary, 'success');
     await refreshFiles();
@@ -1612,15 +1760,22 @@ async function uploadFiles(inputId, preserveFolders){
 async function uploadLocalPath(){
   let ctl;
   try {
-    ctl = beginOperation('Encrypting local path into the vault...');
-    const req = {sourcePath:$('localSourcePath').value, virtualPath:$('uploadPath').value, method:$('localPutMethod').value, rsyncBinary:$('localRsyncBinary').value};
+    const sourcePath = requireLocalSourcePath();
+    if(!sourcePath) return;
+    const method = $('localPutMethod').value || 'auto';
+    ctl = beginOperation('Encrypting local path into the vault with ' + method + ' ingest...');
+    const req = {sourcePath:sourcePath, virtualPath:$('uploadPath').value, method:method, rsyncBinary:$('localRsyncBinary').value};
     const res = await api('/api/upload-path',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req),signal:ctl.signal});
-    endOperation('Local path ingest complete.');
-    showHuman('Local path ingest complete', res, 'success');
+    endOperation('Local path import complete.');
+    showHuman('Local path import complete', res, 'success');
     await refreshFiles();
-  } catch(e){ if(e.name === 'AbortError') showError('Upload cancelled', 'The local path ingest was cancelled.'); else showError('Local path ingest failed', e.message); activeController=null; setBusy(false); }
+  } catch(e){ if(e.name === 'AbortError') showError('Upload cancelled', 'The local path ingest was cancelled.'); else showError('Local path import failed', e.message + '\n\nIf you selected a folder with the browser picker, use Upload selected browser folder. The browser cannot provide a real local disk path to the rsync import field.'); activeController=null; setBusy(false); }
 }
-async function checkRsync(){ try { const bin=encodeURIComponent($('localRsyncBinary').value); const res=await api('/api/rsync/status?binary='+bin); showHuman(res.available?'rsync is available':'rsync is not available', res, res.available?'success':'error'); } catch(e){ showError('Could not check rsync', e.message); } }
+async function checkRsync(){ try { const raw=$('localRsyncBinary').value.trim(); const bin=encodeURIComponent(raw); const res=await api('/api/rsync/status?binary='+bin); const where = raw ? raw : 'managed rsync, then PATH search'; const msg = res.available ? 'Using ' + (res.binary || where) + '.\n' + (res.version || '') + '\nRecommended method: ' + (res.recommended || 'native') : 'Checked ' + where + '. ' + (res.error || 'rsync was not found; native import remains available.'); showHuman(res.available?'rsync is available':'rsync is not available', msg + '\n\n' + JSON.stringify(res, null, 2), res.available?'success':'error'); } catch(e){ showError('Could not check rsync', e.message); } }
+async function rsyncStatus(check){ try { const res=await api('/api/rsync/status?checkUpdate='+(check?'1':'0')); $('rsyncStatus').textContent=JSON.stringify(res,null,2); showHuman('Managed rsync status loaded', res, res.managed && res.managed.runtimeOk ? 'success' : ''); } catch(e){ showError('Could not load rsync status', e.message); } }
+async function rsyncInstall(){ try { const req={version:$('rsyncVersion').value, fromBinary:$('rsyncFromBinary').value, offlineArchive:$('rsyncOfflineArchive').value, runtimeBaseURL:$('rsyncRuntimeBaseURL').value}; const res=await api('/api/rsync/install',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)}); $('rsyncStatus').textContent=JSON.stringify(res,null,2); showHuman('Managed rsync installed', res, 'success'); $('localPutMethod').value='managed-rsync'; $('localRsyncBinary').value=res.binaryPath || ''; } catch(e){ showError('Could not install managed rsync', e.message); } }
+async function rsyncUpdate(){ try { const req={version:$('rsyncVersion').value, fromBinary:$('rsyncFromBinary').value, offlineArchive:$('rsyncOfflineArchive').value, runtimeBaseURL:$('rsyncRuntimeBaseURL').value}; const res=await api('/api/rsync/update',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)}); $('rsyncStatus').textContent=JSON.stringify(res,null,2); showHuman('Managed rsync updated', res, 'success'); $('localPutMethod').value='managed-rsync'; $('localRsyncBinary').value=res.binaryPath || ''; } catch(e){ showError('Could not update managed rsync', e.message); } }
+async function rsyncRollback(){ try { const res=await api('/api/rsync/rollback',{method:'POST',headers:jsonHeaders,body:'{}'}); $('rsyncStatus').textContent=JSON.stringify(res,null,2); showHuman('Managed rsync rolled back', res, 'success'); $('localRsyncBinary').value=res.binaryPath || ''; } catch(e){ showError('Could not rollback managed rsync', e.message); } }
 async function exportVault(dryRun, allFiles){
   let ctl;
   try {
@@ -1677,8 +1832,17 @@ function reportBrowserSupport(){
   if(!supportsFolder) $('folderSupportHint').textContent = 'This browser may not support folder selection. Use local path ingest for folder imports.';
   if(missing.length){ const w=$('compatWarning'); w.style.display='block'; w.textContent='This browser is missing required features: ' + missing.join(', ') + '. Use a current Chromium, Edge, Safari, or Firefox release, or use the CLI.'; }
 }
+document.addEventListener('DOMContentLoaded', () => {
+  const fileInput = $('fileInput');
+  const folderInput = $('folderInput');
+  const uploadPath = $('uploadPath');
+  if(fileInput) fileInput.addEventListener('change', updateUploadSelectionSummaries);
+  if(folderInput) folderInput.addEventListener('change', updateUploadSelectionSummaries);
+  if(uploadPath) uploadPath.addEventListener('input', updateUploadSelectionSummaries);
+  updateUploadSelectionSummaries();
+});
 reportBrowserSupport();
-refreshStatus(); rcloneStatus(false); loadRemotes(); loadSSHKeys();
+refreshStatus(); rsyncStatus(false); rcloneStatus(false); loadRemotes(); loadSSHKeys();
 </script>
 </body>
 </html>`))
