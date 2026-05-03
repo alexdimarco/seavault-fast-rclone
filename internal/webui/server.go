@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -71,8 +72,10 @@ type openRequest struct {
 }
 
 type profileRequest struct {
-	Name      string `json:"name"`
-	VaultPath string `json:"vaultPath"`
+	Name         string `json:"name"`
+	VaultPath    string `json:"vaultPath"`
+	Password     string `json:"password"`
+	SavePassword bool   `json:"savePassword"`
 }
 
 type rcloneInstallRequest struct {
@@ -109,12 +112,28 @@ type sshKeyRequest struct {
 }
 
 type statusResponse struct {
-	Open           bool            `json:"open"`
-	VaultPath      string          `json:"vaultPath,omitempty"`
-	VaultID        string          `json:"vaultId,omitempty"`
-	Config         *vaultConfigDTO `json:"config,omitempty"`
-	Profiles       []profile.Entry `json:"profiles"`
-	SuggestedPaths []string        `json:"suggestedPaths"`
+	Open            bool             `json:"open"`
+	VaultPath       string           `json:"vaultPath,omitempty"`
+	VaultID         string           `json:"vaultId,omitempty"`
+	Config          *vaultConfigDTO  `json:"config,omitempty"`
+	Profiles        []profile.Entry  `json:"profiles"`
+	AvailableVaults []vaultStatusDTO `json:"availableVaults"`
+	SuggestedPaths  []string         `json:"suggestedPaths"`
+}
+
+type vaultStatusDTO struct {
+	Name         string  `json:"name"`
+	VaultPath    string  `json:"vaultPath"`
+	VaultID      string  `json:"vaultId,omitempty"`
+	Exists       bool    `json:"exists"`
+	Open         bool    `json:"open"`
+	Keychain     bool    `json:"keychain"`
+	Status       string  `json:"status"`
+	Error        string  `json:"error,omitempty"`
+	Files        int     `json:"files,omitempty"`
+	Objects      int     `json:"objects,omitempty"`
+	Referenced   int     `json:"referenced,omitempty"`
+	ReferencedMB float64 `json:"referencedMB,omitempty"`
 }
 
 type vaultConfigDTO struct {
@@ -259,13 +278,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, _ := profile.Entries()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	resp := statusResponse{Open: s.vault != nil, VaultPath: s.vaultPath, Profiles: entries, SuggestedPaths: userpath.SuggestedVaultPaths()}
+	open := s.vault != nil
+	vaultPath := s.vaultPath
+	var vaultID string
+	var cfgDTO *vaultConfigDTO
 	if s.vault != nil {
 		cfg := s.vault.Config
-		resp.VaultID = s.vault.ID()
-		resp.Config = &vaultConfigDTO{Version: cfg.Version, KDF: cfg.KDF, Crypto: cfg.Crypto, Chunk: cfg.Chunk, CreatedAt: cfg.CreatedAt, ManifestMode: cfg.Crypto.ManifestMode}
+		vaultID = s.vault.ID()
+		cfgDTO = &vaultConfigDTO{Version: cfg.Version, KDF: cfg.KDF, Crypto: cfg.Crypto, Chunk: cfg.Chunk, CreatedAt: cfg.CreatedAt, ManifestMode: cfg.Crypto.ManifestMode}
 	}
+	s.mu.Unlock()
+	resp := statusResponse{Open: open, VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths()}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -647,7 +670,26 @@ func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, entry)
+		warnings := []string{}
+		if req.SavePassword {
+			if strings.TrimSpace(req.Password) == "" {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: "password is required to save this vault in the OS keychain"})
+				return
+			}
+			cfg, err := vault.ReadConfig(entry.VaultPath)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+				return
+			}
+			if _, err := vault.Open(entry.VaultPath, req.Password); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: "vault location saved, but the password could not open the vault: " + err.Error()})
+				return
+			}
+			if err := keychain.Set(cfg.VaultID, req.Password); err != nil {
+				warnings = append(warnings, "vault location saved, but password was not saved to the OS keychain: "+err.Error())
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "profile": entry, "warnings": warnings})
 	case http.MethodDelete:
 		name := strings.TrimSpace(r.URL.Query().Get("name"))
 		if name == "" {
@@ -915,6 +957,78 @@ func (s *Server) handleSSHKeyPublic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"publicKey": pub})
 }
 
+func (s *Server) availableVaultStatuses(entries []profile.Entry) []vaultStatusDTO {
+	s.mu.Lock()
+	activePath := s.vaultPath
+	activeVault := s.vault
+	s.mu.Unlock()
+
+	out := make([]vaultStatusDTO, 0, len(entries))
+	for _, e := range entries {
+		st := vaultStatusDTO{Name: e.Name, VaultPath: e.VaultPath, Status: "saved"}
+		if activeVault != nil && samePath(e.VaultPath, activePath) {
+			st.Open = true
+		}
+		meta := filepath.Join(e.VaultPath, vault.MetadataDirName, "vault.json")
+		if _, err := os.Stat(meta); err != nil {
+			if os.IsNotExist(err) {
+				st.Status = "missing"
+				st.Error = "vault metadata was not found at " + meta
+			} else {
+				st.Status = "error"
+				st.Error = err.Error()
+			}
+			out = append(out, st)
+			continue
+		}
+		st.Exists = true
+		cfg, err := vault.ReadConfig(e.VaultPath)
+		if err != nil {
+			st.Status = "error"
+			st.Error = err.Error()
+			out = append(out, st)
+			continue
+		}
+		st.VaultID = cfg.VaultID
+		if cfg.VaultID != "" {
+			if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
+				st.Keychain = true
+			}
+		}
+		if st.Open {
+			st.Status = "open"
+			if stats, err := activeVault.Stats(); err == nil {
+				st.Files = stats.Files
+				st.Objects = stats.Objects
+				st.Referenced = stats.Referenced
+				st.ReferencedMB = stats.ReferencedMB
+			}
+		} else if st.Keychain {
+			st.Status = "ready"
+		} else {
+			st.Status = "password required"
+		}
+		out = append(out, st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func samePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil {
+		a = absA
+	}
+	if errB == nil {
+		b = absB
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
 func (s *Server) currentVault(w http.ResponseWriter) (*vault.Vault, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1094,6 +1208,14 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 .row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .checkline { display: inline-flex; gap: 8px; align-items: center; width: auto; }
 .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); font-size: .8rem; }
+.vault-list { display: grid; gap: 10px; margin-top: 14px; }
+.vault-card { border: 1px solid var(--border); border-radius: 12px; padding: 10px; background: var(--panel-2); }
+.vault-card header { all: unset; display: flex; justify-content: space-between; gap: 8px; align-items: start; margin-bottom: 6px; }
+.vault-card .vault-name { font-weight: 700; overflow-wrap: anywhere; }
+.vault-card .vault-path { font-size: .82rem; color: var(--muted); overflow-wrap: anywhere; }
+.vault-card progress { height: 10px; margin-top: 8px; }
+.status-open { border-color: var(--success); background: color-mix(in srgb, var(--success-bg) 60%, var(--panel-2)); }
+.status-error, .status-missing { border-color: var(--danger); background: color-mix(in srgb, var(--danger-bg) 55%, var(--panel-2)); }
 .jump-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .jump-links a { color: var(--focus); text-decoration: none; padding: 4px 0; }
 .jump-links a:hover { text-decoration: underline; }
@@ -1136,7 +1258,13 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 <section id="vault-panel">
   <h2>Open or create vault</h2>
   <div class="form-grid">
-    <label>Vault path or profile
+    <label>Saved vault selector
+      <select id="vaultSelect" onchange="selectSavedVault()">
+        <option value="">Manual path or new vault</option>
+      </select>
+      <small>Choose a saved vault location, then open it with the saved keychain password or a typed password.</small>
+    </label>
+    <label>Vault path or saved name
       <input id="vaultPath" value="{{.InitialPath}}" placeholder="~/Nextcloud/seavault" autocomplete="off">
       <small>This is where encrypted chunks and manifests are stored. Use ~/Nextcloud/seavault or an existing local sync folder. On macOS use /Users/name, not /user/name.</small>
     </label>
@@ -1144,9 +1272,9 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
       <input id="password" type="password" autocomplete="current-password">
       <small>Leave blank only when using a saved OS keychain entry.</small>
     </label>
-    <label>Profile name
+    <label>Saved vault name
       <input id="profile" placeholder="work-cloud" autocomplete="off">
-      <small>Optional local alias for the vault path.</small>
+      <small>Required to save the vault location in the dropdown.</small>
     </label>
     <label>KDF for new vaults
       <select id="kdf">
@@ -1163,12 +1291,14 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   </div>
   {{end}}
   <p class="row-actions">
-    <button type="button" class="operation" onclick="openVault(false)">Open</button>
-    <button type="button" class="operation" onclick="openVault(true)">Open using keychain</button>
+    <button type="button" class="operation" onclick="openVault(false)">Open typed vault</button>
+    <button type="button" class="operation" onclick="openVault(true)">Open selected using keychain</button>
     <button type="button" class="operation" onclick="initVault()">Create vault and open</button>
-    <button type="button" onclick="closeVault()">Close</button>
+    <button type="button" class="operation" onclick="saveCurrentVaultProfile()">Save vault location/password</button>
+    <button type="button" onclick="closeVault()">Close active vault</button>
     <label class="checkline"><input id="savePassword" type="checkbox"> Save password in OS keychain</label>
   </p>
+  <p class="hint">Saved vault locations are stored in the app profile list. Passwords are stored separately in the OS keychain by vault ID. The encrypted vault folder can still be moved by your sync client.</p>
 </section>
 
 <section id="upload-panel">
@@ -1252,8 +1382,9 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 </section>
 
 <section>
-  <h2>Profiles</h2>
-  <p><button onclick="loadProfiles()">Refresh profiles</button></p>
+  <h2>Saved vault locations</h2>
+  <p class="hint">These locations appear in the vault dropdown. Passwords are only stored when you save them to the OS keychain.</p>
+  <p><button onclick="refreshStatus()">Refresh saved vaults</button></p>
   <div id="profiles" class="table-wrap"></div>
 </section>
 
@@ -1323,7 +1454,10 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <div id="message" role="status">Ready.</div>
   <progress id="progress" value="0" max="1"></progress>
   <p id="progressText"><small>No active operation.</small></p>
-  <p class="row-actions"><button class="danger" onclick="cancelActive()">Cancel active operation</button><button class="secondary" onclick="clearOutput()">Clear</button></p>
+  <p class="row-actions"><button class="danger" onclick="cancelActive()">Cancel active operation</button><button class="secondary" onclick="clearOutput()">Clear</button><button class="secondary" onclick="refreshStatus()">Refresh vaults</button></p>
+  <h3>Available saved vaults</h3>
+  <div id="availableVaults" class="vault-list">Loading saved vaults...</div>
+  <h3>Detailed result</h3>
   <pre id="status">Loading...</pre>
 </aside>
 </main>
@@ -1332,6 +1466,7 @@ const token = document.documentElement.dataset.token;
 const jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token};
 let activeController = null;
 let activeCancelled = false;
+let lastStatus = null;
 function $(id){ return document.getElementById(id); }
 function setProgress(done, total, text){ const p=$('progress'); p.max=Math.max(1,total||1); p.value=Math.min(p.max,done||0); $('progressText').innerHTML='<small>'+esc(text||'')+'</small>'; }
 function setBusy(on){ document.body.classList.toggle('busy', !!on); document.querySelectorAll('button.operation').forEach(btn => { btn.disabled = !!on; }); }
@@ -1382,13 +1517,59 @@ function humanize(obj){
 }
 function fmtBytes(n){ n=Number(n||0); const units=['B','KiB','MiB','GiB','TiB']; let i=0; while(n>=1024 && i<units.length-1){ n/=1024; i++; } return (i===0?String(n):n.toFixed(1))+' '+units[i]; }
 function fillPath(p){ $('vaultPath').value = p; }
+function selectSavedVault(){
+  const sel = $('vaultSelect');
+  const opt = sel.options[sel.selectedIndex];
+  if(!opt || !opt.value) return;
+  $('vaultPath').value = opt.dataset.path || opt.value;
+  $('profile').value = opt.dataset.name || '';
+  showHuman('Saved vault selected', 'Selected ' + (opt.dataset.name || opt.value) + '. Click Open selected using keychain, or enter the password and open.');
+}
+function renderVaultSelector(status){
+  const sel = $('vaultSelect');
+  if(!sel) return;
+  const current = sel.value;
+  const rows = status.availableVaults || [];
+  sel.innerHTML = '<option value="">Manual path or new vault</option>' + rows.map(v => '<option value="'+esc(v.name)+'" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'"'+((current && current===v.name) || (!current && status.vaultPath===v.vaultPath)?' selected':'')+'>'+esc(v.name)+' - '+esc(v.status)+'</option>').join('');
+}
+function renderAvailableVaults(status){
+  const box = $('availableVaults');
+  if(!box) return;
+  const rows = status.availableVaults || [];
+  if(rows.length === 0){ box.innerHTML = '<p class="hint">No saved vaults yet. Create or open a vault, enter a saved vault name, select Save password in OS keychain if desired, then click Save vault location/password.</p>'; return; }
+  box.innerHTML = rows.map(v => {
+    const cls = v.open ? 'status-open' : (v.status === 'missing' ? 'status-missing' : (v.status === 'error' ? 'status-error' : ''));
+    const pct = v.open ? 1 : (v.exists ? 0.55 : 0.15);
+    const key = v.keychain ? 'keychain saved' : 'password required';
+    const stats = v.open && v.files !== undefined ? '<br><small>'+Number(v.files||0)+' file(s), '+Number(v.objects||0)+' object(s), '+Number(v.referencedMB||0).toFixed(2)+' MiB referenced</small>' : '';
+    const err = v.error ? '<br><small>'+esc(v.error)+'</small>' : '';
+    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><p class="row-actions"><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="openSavedVault(this.dataset.name,this.dataset.path,true)">Open</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button></p></article>';
+  }).join('');
+}
+function selectVaultCard(name, path){ $('vaultPath').value = path; $('profile').value = name; const sel=$('vaultSelect'); if(sel) sel.value=name; showHuman('Saved vault selected', 'Selected ' + name + '.'); }
+async function openSavedVault(name, path, useKeychain){
+  $('vaultPath').value = name || path;
+  $('profile').value = name || '';
+  await openVault(useKeychain);
+}
 function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
 function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
 function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/user' || p.indexOf('/user/') === 0) return 'The path starts with /user. Use ~/Nextcloud/seavault, /Users/<name>/... on macOS, or /home/<name>/... on Linux.'; return ''; }
-async function refreshStatus(){ try { const s = await api('/api/status'); showHuman('Status refreshed', s); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
-async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
-async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; showHuman('Vault opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
-async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshFiles(); } catch(e){ showError('Could not close vault', e.message); } }
+async function refreshStatus(){ try { const s = await api('/api/status'); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); showHuman('Status refreshed', s); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
+async function saveCurrentVaultProfile(){
+  try {
+    const req = {name:$('profile').value, vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked};
+    if(!req.name.trim()){ showError('Saved vault name required', 'Enter a saved vault name before saving the vault location.'); return; }
+    if(req.savePassword && !req.password.trim()){ showError('Password required', 'Enter the vault password before saving it to the OS keychain.'); return; }
+    const res = await api('/api/profile',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)});
+    if(req.savePassword) $('password').value='';
+    showHuman('Saved vault updated', res, 'success');
+    await refreshStatus();
+  } catch(e){ showError('Could not save vault', e.message); }
+}
+async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
+async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
+async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshStatus(); } catch(e){ showError('Could not close vault', e.message); } }
 async function uploadFiles(inputId, preserveFolders){
   const input = $(inputId);
   let ctl;
@@ -1468,9 +1649,10 @@ async function deleteFile(p){ try { await api('/api/file?path='+p,{method:'DELET
 async function verifyVault(){ try { const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault verification passed', res, 'success'); } catch(e){ showError('Vault verification failed', e.message); } }
 async function loadStats(){ try { const res = await api('/api/stats'); showHuman('Vault statistics', res); } catch(e){ showError('Could not load stats', e.message); } }
 async function loadProfiles(){
-  try { const data = await api('/api/profiles'); const rows = data.profiles || []; $('profiles').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Vault path</th></tr></thead><tbody>'+rows.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="path">'+esc(p.vaultPath)+'</td></tr>').join('')+'</tbody></table>' : '<p>No profiles saved.</p>'; }
+  try { const data = await api('/api/profiles'); const rows = data.profiles || []; $('profiles').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Vault path</th><th>Actions</th></tr></thead><tbody>'+rows.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="path">'+esc(p.vaultPath)+'</td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="openSavedVault(this.dataset.name,this.dataset.path,true)">Open with keychain</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>').join('')+'</tbody></table>' : '<p>No saved vault locations.</p>'; }
   catch(e){ $('profiles').innerHTML = '<p>'+esc(e.message)+'</p>'; }
 }
+async function deleteProfile(name){ try { await api('/api/profile?name='+encodeURIComponent(name),{method:'DELETE',headers:jsonHeaders}); showHuman('Saved vault removed', 'Removed saved vault location ' + name + '. The vault files and keychain password were not deleted.', 'success'); await refreshStatus(); } catch(e){ showError('Could not remove saved vault', e.message); } }
 async function rcloneStatus(check){ try { const s = await api('/api/rclone/status?checkUpdate='+(check?'1':'0')); $('rcloneStatus').textContent = JSON.stringify(s,null,2); } catch(e){ $('rcloneStatus').textContent = e.message; } }
 async function rcloneInstall(){ try { const req={version:$('rcloneVersion').value, channel:'stable', fromBinary:$('rcloneFromBinary').value, signature:$('rcloneSignature').value}; const res=await api('/api/rclone/install',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); showHuman('Rclone install/register complete', res, 'success'); } catch(e){ $('rcloneStatus').textContent=e.message; showError('Rclone install/register failed', e.message); } }
 async function rcloneUpdate(){ try { const req={version:$('rcloneVersion').value, channel:'stable', signature:$('rcloneSignature').value}; const res=await api('/api/rclone/update',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); showHuman('Rclone update complete', res, 'success'); } catch(e){ $('rcloneStatus').textContent=e.message; showError('Rclone update failed', e.message); } }

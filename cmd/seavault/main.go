@@ -29,7 +29,7 @@ import (
 	"github.com/example/seavault-fast/internal/webui"
 )
 
-const version = "0.7.0"
+const version = "0.8.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -461,29 +461,70 @@ func cmdGUI(args []string) error {
 
 func cmdProfile(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: seavault profile add NAME VAULT_DIR | list | remove NAME")
+		return fmt.Errorf("usage: seavault profile add [--save-password] NAME VAULT_DIR | save [--save-password] NAME VAULT_DIR | list [--status] | remove NAME")
 	}
 	switch args[0] {
-	case "add":
-		if len(args) != 3 {
-			return fmt.Errorf("usage: seavault profile add NAME VAULT_DIR")
+	case "add", "save":
+		fs := flag.NewFlagSet("profile "+args[0], flag.ExitOnError)
+		savePassword := fs.Bool("save-password", false, "verify and store this vault password in the OS keychain")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
 		}
-		entry, err := profile.Add(args[1], args[2])
+		if fs.NArg() != 2 {
+			return fmt.Errorf("usage: seavault profile %s [--save-password] NAME VAULT_DIR", args[0])
+		}
+		entry, err := profile.Add(fs.Arg(0), fs.Arg(1))
 		if err != nil {
 			return err
+		}
+		if *savePassword {
+			cfg, err := vault.ReadConfig(entry.VaultPath)
+			if err != nil {
+				return err
+			}
+			password, err := readPasswordPrompt("Vault password to store in OS keychain: ")
+			if err != nil {
+				return err
+			}
+			if _, err := vault.Open(entry.VaultPath, password); err != nil {
+				return fmt.Errorf("profile saved, but password did not open vault: %w", err)
+			}
+			if err := keychain.Set(cfg.VaultID, password); err != nil {
+				return err
+			}
+			fmt.Printf("profile %s -> %s (password saved in OS keychain)\n", entry.Name, entry.VaultPath)
+			return nil
 		}
 		fmt.Printf("profile %s -> %s\n", entry.Name, entry.VaultPath)
 		return nil
 	case "list":
-		if len(args) != 1 {
-			return fmt.Errorf("usage: seavault profile list")
+		fs := flag.NewFlagSet("profile list", flag.ExitOnError)
+		withStatus := fs.Bool("status", false, "include vault existence and keychain status")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("usage: seavault profile list [--status]")
 		}
 		entries, err := profile.Entries()
 		if err != nil {
 			return err
 		}
 		for _, e := range entries {
-			fmt.Printf("%s\t%s\n", e.Name, e.VaultPath)
+			if !*withStatus {
+				fmt.Printf("%s\t%s\n", e.Name, e.VaultPath)
+				continue
+			}
+			status, keychainStatus := "missing", "no keychain entry"
+			if cfg, err := vault.ReadConfig(e.VaultPath); err == nil {
+				status = "vault exists"
+				if cfg.VaultID != "" {
+					if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
+						keychainStatus = "keychain saved"
+					}
+				}
+			}
+			fmt.Printf("%s\t%s\t%s\t%s\n", e.Name, e.VaultPath, status, keychainStatus)
 		}
 		return nil
 	case "remove", "rm":
@@ -1035,8 +1076,9 @@ Usage:
   seavault stats [flags] VAULT_DIR_OR_PROFILE
   seavault serve [flags] VAULT_DIR_OR_PROFILE
   seavault gui [flags] [VAULT_DIR_OR_PROFILE]
-  seavault profile add NAME VAULT_DIR
-  seavault profile list
+  seavault profile add [--save-password] NAME VAULT_DIR
+  seavault profile save [--save-password] NAME VAULT_DIR
+  seavault profile list [--status]
   seavault profile remove NAME
   seavault keychain store VAULT_DIR_OR_PROFILE
   seavault keychain status VAULT_DIR_OR_PROFILE

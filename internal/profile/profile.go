@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 
+	"github.com/example/seavault-fast/internal/appdir"
 	"github.com/example/seavault-fast/internal/userpath"
 )
 
@@ -24,31 +24,11 @@ type Store struct {
 }
 
 func ConfigPath() (string, error) {
-	base := ""
-	switch runtime.GOOS {
-	case "windows":
-		base = os.Getenv("APPDATA")
-		if base == "" {
-			return "", errors.New("APPDATA is not set")
-		}
-		return filepath.Join(base, "SeaVault", "profiles.json"), nil
-	case "darwin":
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(home, "Library", "Application Support", "SeaVault", "profiles.json"), nil
-	default:
-		base = os.Getenv("XDG_CONFIG_HOME")
-		if base == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return "", err
-			}
-			base = filepath.Join(home, ".config")
-		}
-		return filepath.Join(base, "seavault", "profiles.json"), nil
+	base, err := appdir.ConfigDir()
+	if err != nil {
+		return "", err
 	}
+	return filepath.Join(base, "profiles.json"), nil
 }
 
 func Load() (Store, error) {

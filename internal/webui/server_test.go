@@ -65,6 +65,9 @@ func TestIndexUsesResponsiveCrossBrowserLayout(t *testing.T) {
 		`input, select, textarea { width: 100%;`,
 		`class="table-wrap"`,
 		`id="compatWarning"`,
+		`id="vaultSelect"`,
+		`id="availableVaults"`,
+		`Save vault location/password`,
 		`webkitdirectory directory multiple`,
 		`The browser could not reach the local SeaVault GUI service`,
 	}
@@ -72,6 +75,38 @@ func TestIndexUsesResponsiveCrossBrowserLayout(t *testing.T) {
 		if !strings.Contains(html, want) {
 			t.Fatalf("responsive GUI markup missing %q", want)
 		}
+	}
+}
+
+func TestSavedVaultStatusListsProfiledVault(t *testing.T) {
+	t.Setenv("SEAVAULT_APP_HOME", t.TempDir())
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultPath := filepath.Join(t.TempDir(), "cloud", "alpha")
+	rr := postJSON(t, s, "/api/init", map[string]any{
+		"vaultPath": vaultPath,
+		"password":  "passphrase",
+		"profile":   "alpha",
+		"kdf":       "scrypt",
+		"scryptN":   16,
+		"scryptR":   1,
+		"scryptP":   1,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("init failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var status statusResponse
+	if code := getJSON(t, s, "/api/status", &status); code != http.StatusOK {
+		t.Fatalf("status failed: %d", code)
+	}
+	if len(status.AvailableVaults) != 1 {
+		t.Fatalf("expected one saved vault, got %#v", status.AvailableVaults)
+	}
+	got := status.AvailableVaults[0]
+	if got.Name != "alpha" || got.VaultPath != vaultPath || !got.Open || got.Status != "open" {
+		t.Fatalf("unexpected vault status: %#v", got)
 	}
 }
 

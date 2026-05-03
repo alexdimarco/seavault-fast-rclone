@@ -4,6 +4,14 @@ SeaVault Fast is a cross-platform prototype for client-side encrypted storage. I
 
 This repository is a working MVP, not an audited production replacement for Cryptomator.
 
+## What changed in v0.8
+
+- Added saved-vault selection in the GUI with a dropdown for multiple vault locations.
+- Added a right-side saved-vault status list with per-vault status bars, active-vault highlighting, keychain availability, and missing/error indicators.
+- Added GUI support to save a vault location and optionally store its password in the OS keychain.
+- Added CLI `seavault profile save --save-password NAME VAULT_DIR` and `seavault profile list --status`.
+- Moved profile storage onto the shared SeaVault app configuration directory so tests and enterprise deployments can isolate app state with `SEAVAULT_APP_HOME`.
+
 ## What changed in v0.7
 
 - Reworked the GUI into a responsive two-column desktop layout with the result/progress panel on the right.
