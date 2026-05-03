@@ -1,4 +1,4 @@
-.PHONY: test build smoke gui-smoke clean cross
+.PHONY: test build smoke gui-smoke webdav-smoke clean cross
 
 test:
 	go test ./...
@@ -10,10 +10,16 @@ smoke: build
 	./scripts/smoke-test.sh ./bin/seavault
 	./scripts/gui-api-smoke-test.sh ./bin/seavault
 	./scripts/rsync-put-smoke-test.sh ./bin/seavault
+	./scripts/webdav-file-manager-smoke-test.sh ./bin/seavault
 
 gui-smoke: build
 	./scripts/gui-api-smoke-test.sh ./bin/seavault
 	./scripts/rsync-put-smoke-test.sh ./bin/seavault
+	./scripts/webdav-file-manager-smoke-test.sh ./bin/seavault
+
+webdav-smoke: build
+	./scripts/webdav-file-manager-smoke-test.sh ./bin/seavault
+	./scripts/webdav-file-manager-smoke-test.sh ./bin/seavault
 
 cross:
 	mkdir -p dist
