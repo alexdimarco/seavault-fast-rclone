@@ -1,7 +1,6 @@
 package webui
 
 import (
-	"archive/zip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -20,7 +19,6 @@ import (
 	"time"
 
 	"github.com/example/seavault-fast/internal/keychain"
-	"github.com/example/seavault-fast/internal/localdav"
 	"github.com/example/seavault-fast/internal/profile"
 	"github.com/example/seavault-fast/internal/rclonebin"
 	"github.com/example/seavault-fast/internal/remotes"
@@ -36,11 +34,10 @@ import (
 )
 
 type Server struct {
-	mu             sync.Mutex
-	vaultPath      string
-	vault          *vault.Vault
-	token          string
-	webdavReadOnly bool
+	mu        sync.Mutex
+	vaultPath string
+	vault     *vault.Vault
+	token     string
 }
 
 type apiError struct {
@@ -135,25 +132,12 @@ type sshKeyRequest struct {
 
 type statusResponse struct {
 	Open            bool             `json:"open"`
-	BrowserToken    string           `json:"browserToken,omitempty"`
-	WebDAV          webdavStatusDTO  `json:"webdav"`
 	VaultPath       string           `json:"vaultPath,omitempty"`
 	VaultID         string           `json:"vaultId,omitempty"`
 	Config          *vaultConfigDTO  `json:"config,omitempty"`
 	Profiles        []profile.Entry  `json:"profiles"`
 	AvailableVaults []vaultStatusDTO `json:"availableVaults"`
 	SuggestedPaths  []string         `json:"suggestedPaths"`
-}
-
-type webdavStatusDTO struct {
-	Running  bool   `json:"running"`
-	ReadOnly bool   `json:"readOnly"`
-	URL      string `json:"url"`
-	FilesURL string `json:"filesUrl"`
-}
-
-type webdavRequest struct {
-	ReadOnly bool `json:"readOnly"`
 }
 
 type vaultStatusDTO struct {
@@ -228,12 +212,8 @@ func New(initialVault string) (*Server, error) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/" || r.URL.Path == "/index.html" || r.URL.Path == "/files" || strings.HasPrefix(r.URL.Path, "/files/") {
+	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
 		s.handleIndex(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/dav/") {
-		s.handleWebDAV(w, r)
 		return
 	}
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
@@ -266,12 +246,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleDownload(w, r)
 	case "/api/export":
 		s.handleExport(w, r)
-	case "/api/export-zip":
-		s.handleExportZipDownload(w, r)
 	case "/api/file":
 		s.handleFile(w, r)
-	case "/api/webdav":
-		s.handleWebDAVStatus(w, r)
 	case "/api/verify":
 		s.handleVerify(w, r)
 	case "/api/stats":
@@ -340,7 +316,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		cfgDTO = &vaultConfigDTO{Version: cfg.Version, KDF: cfg.KDF, Crypto: cfg.Crypto, Chunk: cfg.Chunk, CreatedAt: cfg.CreatedAt, ManifestMode: cfg.Crypto.ManifestMode}
 	}
 	s.mu.Unlock()
-	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths()}
+	resp := statusResponse{Open: open, VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths()}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -463,9 +439,8 @@ func (s *Server) handleClose(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.vault = nil
-	s.token = mustRandomToken(s.token)
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "browserToken": s.tokenValue(), "webdav": s.webdavStatus()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -639,96 +614,6 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
-}
-
-func (s *Server) handleExportZipDownload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		methodNotAllowed(w)
-		return
-	}
-	if r.URL.Query().Get("token") != s.tokenValue() {
-		writeJSON(w, http.StatusForbidden, apiError{Error: "invalid browser session token"})
-		return
-	}
-	v, ok := s.currentVault(w)
-	if !ok {
-		return
-	}
-	vp, err := vault.CleanVirtualPath(r.URL.Query().Get("path"))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
-		return
-	}
-	if vp == "" {
-		vp = "."
-	}
-	files, err := v.Files()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
-		return
-	}
-	targets := make([]string, 0)
-	if _, ok := files[vp]; ok && vp != "." {
-		targets = append(targets, vp)
-	} else {
-		prefix := strings.Trim(vp, "/")
-		if prefix == "." {
-			prefix = ""
-		}
-		if prefix != "" {
-			prefix += "/"
-		}
-		for p := range files {
-			if prefix == "" || strings.HasPrefix(p, prefix) {
-				targets = append(targets, p)
-			}
-		}
-	}
-	if len(targets) == 0 {
-		writeJSON(w, http.StatusNotFound, apiError{Error: "virtual path not found"})
-		return
-	}
-	sort.Strings(targets)
-	zipName := strings.Trim(path.Base(strings.TrimSuffix(vp, "/")), ".")
-	if zipName == "" || zipName == "/" {
-		zipName = "seavault-export"
-	}
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", zipName+".zip"))
-	w.Header().Set("Cache-Control", "no-store")
-	if r.Method == http.MethodHead {
-		return
-	}
-	zw := zip.NewWriter(w)
-	defer zw.Close()
-	prefixToStrip := ""
-	if _, fileSelected := files[vp]; !fileSelected {
-		prefixToStrip = strings.Trim(vp, "/")
-		if prefixToStrip == "." {
-			prefixToStrip = ""
-		}
-		if prefixToStrip != "" {
-			prefixToStrip += "/"
-		}
-	}
-	for _, p := range targets {
-		rec := files[p]
-		name := strings.TrimPrefix(p, prefixToStrip)
-		if name == "" {
-			name = path.Base(p)
-		}
-		h := &zip.FileHeader{Name: name, Method: zip.Deflate}
-		if t, err := time.Parse(time.RFC3339Nano, rec.ModTime); err == nil {
-			h.SetModTime(t)
-		}
-		fw, err := zw.CreateHeader(h)
-		if err != nil {
-			return
-		}
-		if err := v.WriteFileTo(p, fw); err != nil {
-			return
-		}
-	}
 }
 
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
@@ -1223,73 +1108,6 @@ func (s *Server) handleSSHKeyPublic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"publicKey": pub})
 }
 
-func (s *Server) tokenValue() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.token
-}
-
-func mustRandomToken(fallback string) string {
-	token, err := randomToken()
-	if err != nil || token == "" {
-		return fallback
-	}
-	return token
-}
-
-func (s *Server) webdavStatus() webdavStatusDTO {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	running := s.vault != nil
-	url := ""
-	if running {
-		url = "/dav/" + s.token + "/"
-	}
-	return webdavStatusDTO{Running: running, ReadOnly: s.webdavReadOnly, URL: url, FilesURL: "/files/"}
-}
-
-func (s *Server) handleWebDAV(w http.ResponseWriter, r *http.Request) {
-	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/dav/"), "/", 2)
-	if len(parts) == 0 || parts[0] == "" {
-		http.Error(w, "missing WebDAV session token", http.StatusForbidden)
-		return
-	}
-	s.mu.Lock()
-	validToken := parts[0] == s.token
-	v := s.vault
-	readOnly := s.webdavReadOnly
-	token := s.token
-	s.mu.Unlock()
-	if !validToken {
-		http.Error(w, "invalid WebDAV session token", http.StatusForbidden)
-		return
-	}
-	if v == nil {
-		http.Error(w, "no vault is open", http.StatusConflict)
-		return
-	}
-	dav := &localdav.Server{Vault: v, ReadOnly: readOnly, Prefix: "/dav/" + token + "/"}
-	dav.ServeHTTP(w, r)
-}
-
-func (s *Server) handleWebDAVStatus(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.webdavStatus())
-	case http.MethodPost:
-		var req webdavRequest
-		if !decodeJSON(w, r, &req) {
-			return
-		}
-		s.mu.Lock()
-		s.webdavReadOnly = req.ReadOnly
-		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, s.webdavStatus())
-	default:
-		methodNotAllowed(w)
-	}
-}
-
 func (s *Server) availableVaultStatuses(entries []profile.Entry) []vaultStatusDTO {
 	s.mu.Lock()
 	activePath := s.vaultPath
@@ -1555,17 +1373,6 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 .jump-links a { color: var(--focus); text-decoration: none; padding: 4px 0; }
 .jump-links a:hover { text-decoration: underline; }
 .compat-warning { display: none; padding: 10px 12px; border-radius: 12px; background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); margin-top: 12px; }
-
-.file-manager-grid { display: grid; grid-template-columns: minmax(180px, 260px) minmax(0, 1fr); gap: 12px; }
-.folder-tree, .file-browser { border: 1px solid var(--border); border-radius: 12px; background: var(--panel-2); padding: 12px; min-width: 0; }
-.folder-tree ul { margin: 0; padding-left: 18px; }
-.folder-tree button, .breadcrumb button { padding: 5px 7px; border-radius: 8px; background: transparent; border-color: transparent; text-align: left; }
-.breadcrumb { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
-.drop-zone { border: 2px dashed var(--border); border-radius: 12px; padding: 14px; text-align: center; color: var(--muted); background: var(--panel); margin: 10px 0; }
-.drop-zone.dragover { border-color: var(--focus); color: var(--fg); }
-.file-table tr.selected { background: color-mix(in srgb, var(--focus) 12%, transparent); }
-.file-table td:first-child { word-break: break-word; }
-@media (max-width: 840px) { .file-manager-grid { grid-template-columns: 1fr; } }
 @supports not (outline: 3px solid color-mix(in srgb, #2563eb 35%, transparent)) {
   button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus); }
 }
@@ -1594,7 +1401,7 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
     <a href="#upload-panel">Upload</a>
     <a href="#move-panel">Move vault</a>
     <a href="#export-panel">Export</a>
-    <a href="/files/">WebDAV files</a>
+    <a href="#files-panel">Files</a>
     <a href="#remote-panel">Remote</a>
     <a href="#managed-tools-panel">Managed tools</a>
     <a href="#keys-panel">SSH keys</a>
@@ -1758,46 +1565,8 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 </section>
 
 <section id="files-panel">
-  <h2>WebDAV file manager</h2>
-  <p class="hint">This is SeaVault's built-in WebDAV client. It talks to the local same-origin WebDAV endpoint and does not depend on Finder, Windows Explorer, GNOME Files, KDE Dolphin, davfs2, WinFsp, macFUSE, or FUSE.</p>
-  <p class="row-actions">
-    <button class="operation" onclick="refreshDavFiles()">Refresh folder</button>
-    <button class="operation" onclick="createDavFolder()">New folder</button>
-    <button class="operation" onclick="downloadSelectedDav()">Download selected file</button>
-    <button class="operation" onclick="downloadSelectedDavZip()">Download selected folder as ZIP</button>
-    <button class="operation" onclick="renameSelectedDav()">Rename/move</button>
-    <button class="operation" onclick="copySelectedDav()">Copy</button>
-    <button class="danger operation" onclick="deleteSelectedDav()">Delete</button>
-    <button class="secondary" onclick="copyDavURL()">Copy WebDAV URL</button>
-    <label class="checkline"><input id="webdavReadOnly" type="checkbox" onchange="toggleWebDAVReadOnly()"> Read-only WebDAV mode</label>
-  </p>
-  <div class="form-grid">
-    <label>Upload files through WebDAV
-      <input id="davFileInput" type="file" multiple>
-      <small>Files upload into the current WebDAV folder.</small>
-    </label>
-    <label>Upload folder through WebDAV
-      <input id="davFolderInput" type="file" webkitdirectory directory multiple>
-      <small>Folder uploads preserve browser-provided relative paths.</small>
-    </label>
-  </div>
-  <div id="davDropZone" class="drop-zone">Drop files here to upload into the current folder.</div>
-  <div class="file-manager-grid">
-    <div class="folder-tree">
-      <strong>Folder tree</strong>
-      <div id="davTree"><p class="hint">Open a vault, then refresh.</p></div>
-    </div>
-    <div class="file-browser">
-      <div id="davBreadcrumb" class="breadcrumb"></div>
-      <div id="davTable" class="table-wrap"><p class="hint">Open a vault to browse files.</p></div>
-    </div>
-  </div>
-</section>
-
-<section id="legacy-files-panel">
-  <h2>Advanced raw file list</h2>
-  <p class="hint">Debug view of virtual paths and chunk counts. Use the WebDAV file manager above for normal file browsing.</p>
-  <p class="row-actions"><button onclick="refreshFiles()">Refresh raw list</button><button onclick="verifyVault()">Verify</button><button onclick="loadStats()">Stats</button></p>
+  <h2>Vault files</h2>
+  <p class="row-actions"><button onclick="refreshFiles()">Refresh</button><button onclick="verifyVault()">Verify</button><button onclick="loadStats()">Stats</button></p>
   <div id="files" class="table-wrap"></div>
 </section>
 
@@ -1905,8 +1674,6 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <progress id="progress" value="0" max="1"></progress>
   <p id="progressText"><small>No active operation.</small></p>
   <p class="row-actions"><button class="danger" onclick="cancelActive()">Cancel active operation</button><button class="secondary" onclick="clearOutput()">Clear</button><button class="secondary" onclick="refreshStatus()">Refresh vaults</button></p>
-  <h3>WebDAV file manager</h3>
-  <div id="webdavStatusBox"><p class="hint">WebDAV status will appear after refresh.</p></div>
   <h3>Available saved vaults</h3>
   <div id="availableVaults" class="vault-list">Loading saved vaults...</div>
   <h3>Detailed result</h3>
@@ -1914,15 +1681,11 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 </aside>
 </main>
 <script>
-let token = document.documentElement.dataset.token;
-let jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token};
+const token = document.documentElement.dataset.token;
+const jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token};
 let activeController = null;
 let activeCancelled = false;
 let lastStatus = null;
-let currentDavPath = '';
-let selectedDavPath = '';
-let selectedDavIsDir = false;
-function updateSessionToken(t){ if(t && t !== token){ token = t; document.documentElement.dataset.token = t; jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token}; } }
 function $(id){ return document.getElementById(id); }
 function setProgress(done, total, text){ const p=$('progress'); p.max=Math.max(1,total||1); p.value=Math.min(p.max,done||0); $('progressText').innerHTML='<small>'+esc(text||'')+'</small>'; }
 function setBusy(on){ document.body.classList.toggle('busy', !!on); document.querySelectorAll('button.operation').forEach(btn => { btn.disabled = !!on; }); }
@@ -1939,7 +1702,6 @@ async function api(path, opts){
   const ct = res.headers.get('content-type') || '';
   let body;
   if(ct.indexOf('application/json') >= 0){ body = await res.json(); } else { body = await res.text(); }
-  if(body && body.browserToken) updateSessionToken(body.browserToken);
   if(!res.ok) throw new Error((body && body.error) || body || res.statusText);
   return body;
 }
@@ -2049,7 +1811,7 @@ async function openSavedVault(name, path, useKeychain){
 function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
 function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
 function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/user' || p.indexOf('/user/') === 0) return 'The path starts with /user. Use ~/Nextcloud/seavault, /Users/<name>/... on macOS, or /home/<name>/... on Linux.'; return ''; }
-async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderWebDAVStatus(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
+async function refreshStatus(){ try { const s = await api('/api/status'); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); showHuman('Status refreshed', s); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
 async function saveCurrentVaultProfile(){
   try {
     const req = {name:$('profile').value, vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked};
@@ -2061,8 +1823,8 @@ async function saveCurrentVaultProfile(){
     await refreshStatus();
   } catch(e){ showError('Could not save vault', e.message); }
 }
-async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderWebDAVStatus(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
-async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderWebDAVStatus(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
+async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
+async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
 async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshStatus(); } catch(e){ showError('Could not close vault', e.message); } }
 function fileSizeTotal(files){ return Array.from(files || []).reduce((n,f)=>n+(f.size||0),0); }
 function commonFolderRoot(files){
@@ -2178,136 +1940,6 @@ async function exportVault(dryRun, allFiles){
     showHuman(dryRun?'Dry-run export complete':'Export complete', res, 'success');
   } catch(e){ if(e.name === 'AbortError') showError('Export cancelled', 'The export request was cancelled. Partially exported files may remain at the destination.'); else showError('Export failed', e.message); activeController=null; setBusy(false); }
 }
-
-function davURL(p){
-  const base = (lastStatus && lastStatus.webdav && lastStatus.webdav.url) ? lastStatus.webdav.url : ('/dav/' + token + '/');
-  const clean = String(p || '').replace(/^\/+/, '');
-  return base + clean.split('/').filter(Boolean).map(encodeURIComponent).join('/') + (clean.endsWith('/') && clean ? '/' : '');
-}
-function davPathFromHref(href){
-  let h = String(href || '');
-  try { h = new URL(h, window.location.origin).pathname; } catch(_) {}
-  const marker = '/dav/' + token + '/';
-  if(h.indexOf(marker) >= 0) h = h.slice(h.indexOf(marker) + marker.length);
-  h = decodeURIComponent(h).replace(/^\/+|\/+$/g, '');
-  return h;
-}
-async function davFetch(method, p, opts){
-  opts = opts || {};
-  opts.method = method;
-  opts.headers = Object.assign({}, opts.headers || {}, {'X-SeaVault-Token': token});
-  const res = await fetch(davURL(p), opts);
-  if(!res.ok) throw new Error(await res.text() || res.statusText);
-  return res;
-}
-async function davPropfind(p){
-  const res = await davFetch('PROPFIND', p, {headers:{'Depth':'1'}});
-  const text = await res.text();
-  const doc = new DOMParser().parseFromString(text, 'application/xml');
-  return Array.from(doc.getElementsByTagNameNS('DAV:', 'response')).map(node => {
-    const hrefNode = node.getElementsByTagNameNS('DAV:', 'href')[0];
-    const lenNode = node.getElementsByTagNameNS('DAV:', 'getcontentlength')[0];
-    const modNode = node.getElementsByTagNameNS('DAV:', 'getlastmodified')[0];
-    const collection = node.getElementsByTagNameNS('DAV:', 'collection').length > 0;
-    const path = davPathFromHref(hrefNode ? hrefNode.textContent : '');
-    return {path:path, name:path ? path.split('/').filter(Boolean).pop() : '/', isDir:collection, size:lenNode?Number(lenNode.textContent||0):0, modified:modNode?modNode.textContent:''};
-  });
-}
-async function refreshDavFiles(){
-  try {
-    if(!(lastStatus && lastStatus.open)){ $('davTable').innerHTML='<p class="hint">Open a vault to browse files.</p>'; return; }
-    const rows = await davPropfind(currentDavPath);
-    renderDavBreadcrumb();
-    renderDavTable(rows.filter(x => x.path !== currentDavPath.replace(/^\/+|\/+$/g,'')));
-    await renderDavTree();
-    renderWebDAVStatus(lastStatus);
-  } catch(e){ showError('WebDAV browse failed', e.message); $('davTable').innerHTML='<p>'+esc(e.message)+'</p>'; }
-}
-function renderDavBreadcrumb(){
-  const parts = currentDavPath ? currentDavPath.split('/').filter(Boolean) : [];
-  let acc = '';
-  let html = '<button onclick="openDavFolder(\'\')">Vault root</button>';
-  parts.forEach(part => { acc = acc ? acc + '/' + part : part; html += '<span>/</span><button data-path="'+esc(acc)+'" onclick="openDavFolder(this.dataset.path)">'+esc(part)+'</button>'; });
-  $('davBreadcrumb').innerHTML = html;
-}
-function renderDavTable(rows){
-  rows.sort((a,b)=>(a.isDir===b.isDir?0:(a.isDir?-1:1)) || a.name.localeCompare(b.name));
-  if(rows.length===0){ $('davTable').innerHTML='<p class="hint">This folder is empty.</p>'; selectedDavPath=''; selectedDavIsDir=false; return; }
-  $('davTable').innerHTML = '<table class="file-table"><thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Modified</th></tr></thead><tbody>' + rows.map(r => '<tr data-path="'+esc(r.path)+'" data-dir="'+(r.isDir?'1':'0')+'" onclick="selectDavRow(this)" ondblclick="davRowOpen(this)"><td class="path">'+esc(r.name || '/')+(r.isDir?' /':'')+'</td><td>'+(r.isDir?'folder':'file')+'</td><td>'+(r.isDir?'':fmtBytes(r.size))+'</td><td>'+esc(r.modified||'')+'</td></tr>').join('') + '</tbody></table>';
-}
-async function renderDavTree(){
-  const files = await api('/api/files');
-  const dirs = new Set(['']);
-  (files.files||[]).forEach(f => { let parts=String(f.path).split('/'); let acc=''; for(let i=0;i<parts.length-1;i++){ acc=acc?acc+'/'+parts[i]:parts[i]; dirs.add(acc); } });
-  const sorted = Array.from(dirs).sort();
-  $('davTree').innerHTML = '<ul>' + sorted.map(d => '<li><button data-path="'+esc(d)+'" onclick="openDavFolder(this.dataset.path)">'+esc(d || 'Vault root')+'</button></li>').join('') + '</ul>';
-}
-function selectDavRow(row){
-  document.querySelectorAll('.file-table tr.selected').forEach(r=>r.classList.remove('selected'));
-  row.classList.add('selected');
-  selectedDavPath = row.dataset.path || '';
-  selectedDavIsDir = row.dataset.dir === '1';
-  setProgress(0,1,'Selected ' + (selectedDavIsDir?'folder ':'file ') + (selectedDavPath || 'vault root') + '.');
-  renderWebDAVStatus(lastStatus);
-}
-function davRowOpen(row){ if(row.dataset.dir==='1') openDavFolder(row.dataset.path || ''); else downloadDavPath(row.dataset.path || ''); }
-async function openDavFolder(p){ currentDavPath = String(p||'').replace(/^\/+|\/+$/g,''); selectedDavPath=''; selectedDavIsDir=false; await refreshDavFiles(); }
-async function createDavFolder(){
-  try { const name = prompt('New folder name'); if(!name) return; const p = [currentDavPath, name].filter(Boolean).join('/'); await davFetch('MKCOL', p); showHuman('Folder created', 'Created folder ' + p + '. Empty folders are virtual until files are added.', 'success'); await refreshDavFiles(); }
-  catch(e){ showError('Create folder failed', e.message); }
-}
-function downloadDavPath(p){ const a=document.createElement('a'); a.href=davURL(p); a.download=(p||'download').split('/').pop(); document.body.appendChild(a); a.click(); a.remove(); }
-function downloadSelectedDav(){ if(!selectedDavPath || selectedDavIsDir){ showError('Select a file', 'Select a file before downloading. Use Download selected folder as ZIP for folders.'); return; } downloadDavPath(selectedDavPath); }
-function downloadSelectedDavZip(){
-  if(!selectedDavPath || !selectedDavIsDir){ showError('Select a folder', 'Select a folder before downloading it as a ZIP.'); return; }
-  window.location = '/api/export-zip?path=' + encodeURIComponent(selectedDavPath) + '&token=' + encodeURIComponent(token);
-  showHuman('ZIP download started', 'The selected folder is being streamed as a ZIP download by the local SeaVault server.');
-}
-async function renameSelectedDav(){
-  try { if(!selectedDavPath){ showError('Select an item', 'Select a file or folder first.'); return; } const dst=prompt('Move/rename to virtual path:', selectedDavPath); if(!dst || dst===selectedDavPath) return; await davFetch('MOVE', selectedDavPath, {headers:{'Destination':davURL(dst)}}); showHuman('Move complete', 'Moved ' + selectedDavPath + ' to ' + dst + '.', 'success'); selectedDavPath=''; await refreshDavFiles(); }
-  catch(e){ showError('Move failed', e.message); }
-}
-async function copySelectedDav(){
-  try { if(!selectedDavPath){ showError('Select an item', 'Select a file or folder first.'); return; } const dst=prompt('Copy to virtual path:', selectedDavPath + '-copy'); if(!dst || dst===selectedDavPath) return; await davFetch('COPY', selectedDavPath, {headers:{'Destination':davURL(dst)}}); showHuman('Copy complete', 'Copied ' + selectedDavPath + ' to ' + dst + '.', 'success'); await refreshDavFiles(); }
-  catch(e){ showError('Copy failed', e.message); }
-}
-async function deleteSelectedDav(){
-  try { if(!selectedDavPath){ showError('Select an item', 'Select a file or folder first.'); return; } if(!confirm('Delete ' + selectedDavPath + ' from the vault?')) return; await davFetch('DELETE', selectedDavPath); showHuman('Delete complete', 'Deleted ' + selectedDavPath + ' from the virtual vault view. Tombstones prevent deleted files from being resurrected by sync.', 'success'); selectedDavPath=''; await refreshDavFiles(); }
-  catch(e){ showError('Delete failed', e.message); }
-}
-async function uploadDavFiles(files, preserveFolders){
-  if(!files || files.length===0){ showError('Nothing selected', 'Select files or a folder first.'); return; }
-  const arr=Array.from(files);
-  const ctl=beginOperation('Uploading through WebDAV...');
-  try{
-    for(let i=0;i<arr.length;i++){
-      const f=arr[i];
-      const rel=preserveFolders?(f.webkitRelativePath||f.name):f.name;
-      const dest=[currentDavPath, rel].filter(Boolean).join('/');
-      setProgress(i, arr.length, 'Uploading ' + (i+1) + ' of ' + arr.length + ': ' + rel);
-      await davFetch('PUT', dest, {body:f, signal:ctl.signal});
-    }
-    endOperation('WebDAV upload complete.');
-    showHuman('WebDAV upload complete', 'Uploaded ' + arr.length + ' file(s) into ' + (currentDavPath || 'vault root') + '.', 'success');
-    await refreshDavFiles();
-  } catch(e){ if(e.name==='AbortError') showError('WebDAV upload cancelled', 'The upload was cancelled. Files already written remain in the vault.'); else showError('WebDAV upload failed', e.message); activeController=null; setBusy(false); }
-}
-async function copyDavURL(){
-  const url = window.location.origin + davURL(currentDavPath);
-  try { await navigator.clipboard.writeText(url); showHuman('WebDAV URL copied', url, 'success'); }
-  catch(_) { showHuman('Copy this WebDAV URL', url); }
-}
-async function toggleWebDAVReadOnly(){
-  try { const res=await api('/api/webdav',{method:'POST',headers:jsonHeaders,body:JSON.stringify({readOnly:$('webdavReadOnly').checked})}); showHuman('WebDAV mode updated', res, 'success'); if(lastStatus) lastStatus.webdav = res; renderWebDAVStatus(lastStatus); }
-  catch(e){ showError('Could not update WebDAV mode', e.message); }
-}
-function renderWebDAVStatus(status){
-  const box=$('webdavStatusBox'); if(!box) return;
-  const wd=(status&&status.webdav)||{};
-  if($('webdavReadOnly')) $('webdavReadOnly').checked = !!wd.readOnly;
-  const selected = selectedDavPath ? (selectedDavIsDir?'folder ':'file ') + selectedDavPath : 'none';
-  box.innerHTML = '<div class="vault-card '+(wd.running?'status-open':'status-missing')+'"><header><span class="vault-name">WebDAV</span><span class="pill">'+(wd.running?'running':'stopped')+'</span></header><small>Mode: '+(wd.readOnly?'read-only':'read/write')+'<br>Current path: '+esc(currentDavPath||'vault root')+'<br>Selected: '+esc(selected)+'</small><div class="vault-path">'+esc(wd.url||'Open a vault to start WebDAV')+'</div><progress value="'+(wd.running?1:0.15)+'" max="1"></progress></div>';
-}
 async function refreshFiles(){
   try {
     const data = await api('/api/files');
@@ -2360,16 +1992,6 @@ document.addEventListener('DOMContentLoaded', () => {
   if(fileInput) fileInput.addEventListener('change', updateUploadSelectionSummaries);
   if(folderInput) folderInput.addEventListener('change', updateUploadSelectionSummaries);
   if(uploadPath) uploadPath.addEventListener('input', updateUploadSelectionSummaries);
-  const davFileInput = $('davFileInput');
-  const davFolderInput = $('davFolderInput');
-  const dropZone = $('davDropZone');
-  if(davFileInput) davFileInput.addEventListener('change', () => uploadDavFiles(davFileInput.files, false));
-  if(davFolderInput) davFolderInput.addEventListener('change', () => uploadDavFiles(davFolderInput.files, true));
-  if(dropZone){
-    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
-    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-    dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('dragover'); uploadDavFiles(e.dataTransfer.files, false); });
-  }
   updateUploadSelectionSummaries();
 });
 reportBrowserSupport();

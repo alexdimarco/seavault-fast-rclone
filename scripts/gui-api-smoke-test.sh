@@ -49,12 +49,7 @@ post_json() {
 mkdir -p "$(dirname "$VAULT")"
 post_json /api/init "{\"vaultPath\":\"$VAULT\",\"password\":\"$PASSWORD\",\"kdf\":\"scrypt\",\"scryptN\":16,\"scryptR\":1,\"scryptP\":1}" | grep -q '"opened":true'
 curl -fsS "$URL/api/status" | grep -q '"open":true'
-CLOSE_RESP="$(post_json /api/close '{}')"
-printf '%s' "$CLOSE_RESP" | grep -q '"ok":true'
-NEW_TOKEN="$(printf '%s' "$CLOSE_RESP" | sed -n 's/.*"browserToken":"\([^"]*\)".*/\1/p' | head -n 1)"
-if [[ -n "$NEW_TOKEN" ]]; then
-  TOKEN="$NEW_TOKEN"
-fi
+post_json /api/close '{}' | grep -q '"ok":true'
 post_json /api/open "{\"vaultPath\":\"$VAULT\",\"password\":\"$PASSWORD\",\"profile\":\"ignored-old-form-field\",\"kdf\":\"scrypt\",\"savePassword\":false,\"useKeychain\":false}" | grep -q '"opened":true'
 curl -fsS "$URL/api/status" | grep -q '"open":true'
 
