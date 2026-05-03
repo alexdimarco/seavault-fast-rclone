@@ -1,0 +1,984 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/example/seavault-fast/internal/keychain"
+	"github.com/example/seavault-fast/internal/localdav"
+	"github.com/example/seavault-fast/internal/passphrase"
+	"github.com/example/seavault-fast/internal/profile"
+	"github.com/example/seavault-fast/internal/rclonebin"
+	"github.com/example/seavault-fast/internal/remotes"
+	"github.com/example/seavault-fast/internal/sshkeys"
+	"github.com/example/seavault-fast/internal/transport"
+	localtransport "github.com/example/seavault-fast/internal/transport/local"
+	rclonetransport "github.com/example/seavault-fast/internal/transport/rclone"
+	"github.com/example/seavault-fast/internal/userpath"
+	"github.com/example/seavault-fast/internal/vault"
+	"github.com/example/seavault-fast/internal/webui"
+)
+
+const version = "0.4.0"
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+
+	var err error
+	switch os.Args[1] {
+	case "init":
+		err = cmdInit(os.Args[2:])
+	case "put":
+		err = cmdPut(os.Args[2:])
+	case "get":
+		err = cmdGet(os.Args[2:])
+	case "list":
+		err = cmdList(os.Args[2:])
+	case "remove", "rm":
+		err = cmdRemove(os.Args[2:])
+	case "verify":
+		err = cmdVerify(os.Args[2:])
+	case "gc":
+		err = cmdGC(os.Args[2:])
+	case "stats":
+		err = cmdStats(os.Args[2:])
+	case "serve":
+		err = cmdServe(os.Args[2:])
+	case "gui":
+		err = cmdGUI(os.Args[2:])
+	case "profile":
+		err = cmdProfile(os.Args[2:])
+	case "keychain":
+		err = cmdKeychain(os.Args[2:])
+	case "rclone":
+		err = cmdRclone(os.Args[2:])
+	case "remote":
+		err = cmdRemote(os.Args[2:])
+	case "ssh-key":
+		err = cmdSSHKey(os.Args[2:])
+	case "version":
+		fmt.Println(version)
+		return
+	default:
+		usage()
+		os.Exit(2)
+	}
+
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func cmdInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	min := fs.Int("min", 2*1024*1024, "minimum chunk size in bytes")
+	avg := fs.Int("avg", 8*1024*1024, "target average chunk size in bytes")
+	max := fs.Int("max", 16*1024*1024, "maximum chunk size in bytes")
+	kdf := fs.String("kdf", "argon2id", "key derivation function: argon2id, scrypt, or pbkdf2")
+	argonTime := fs.Int("argon2-time", vault.DefaultArgon2Time, "Argon2id time cost")
+	argonMemory := fs.Int("argon2-memory", vault.DefaultArgon2Memory, "Argon2id memory cost in KiB")
+	argonParallelism := fs.Int("argon2-parallelism", vault.DefaultArgon2Threads, "Argon2id parallelism")
+	scryptN := fs.Int("scrypt-n", vault.DefaultScryptN, "scrypt N parameter")
+	scryptR := fs.Int("scrypt-r", vault.DefaultScryptR, "scrypt r parameter")
+	scryptP := fs.Int("scrypt-p", vault.DefaultScryptP, "scrypt p parameter")
+	pbkdf2Iter := fs.Int("pbkdf2-iterations", vault.DefaultKDFIterations, "PBKDF2 iterations for legacy mode")
+	savePassword := fs.Bool("save-password", false, "store the vault password in the OS keychain after initialization")
+	profileName := fs.String("profile", "", "optional local profile name for this vault path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: seavault init [flags] VAULT_DIR")
+	}
+	vaultPath, err := userpath.Abs(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if err := userpath.ValidateCreatableVaultPath(vaultPath); err != nil {
+		return err
+	}
+	password, err := readPasswordPrompt("New vault password: ")
+	if err != nil {
+		return err
+	}
+	params := vault.ChunkParams{MinSize: *min, AvgSize: *avg, MaxSize: *max}
+	var kdfCfg vault.KDFConfig
+	switch strings.ToLower(strings.TrimSpace(*kdf)) {
+	case "", "argon2id", "argon2-id":
+		kdfCfg = vault.KDFConfig{Algorithm: "ARGON2ID", Time: *argonTime, MemoryKiB: *argonMemory, Parallelism: *argonParallelism}
+	case "scrypt":
+		kdfCfg = vault.KDFConfig{Algorithm: "SCRYPT", ScryptN: *scryptN, ScryptR: *scryptR, ScryptP: *scryptP}
+	case "pbkdf2", "pbkdf2-hmac-sha256":
+		kdfCfg = vault.KDFConfig{Algorithm: "PBKDF2-HMAC-SHA256", Iterations: *pbkdf2Iter}
+	default:
+		return fmt.Errorf("unsupported KDF %q", *kdf)
+	}
+	if err := vault.CreateWithOptions(vaultPath, password, vault.CreateOptions{Chunk: params, KDF: kdfCfg}); err != nil {
+		return err
+	}
+	if *profileName != "" {
+		if _, err := profile.Add(*profileName, vaultPath); err != nil {
+			return err
+		}
+	}
+	if *savePassword {
+		cfg, err := vault.ReadConfig(vaultPath)
+		if err != nil {
+			return err
+		}
+		if err := keychain.Set(cfg.VaultID, password); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("initialized vault at %s\n", filepath.Join(vaultPath, vault.MetadataDirName))
+	return nil
+}
+
+func cmdPut(args []string) error {
+	fs := flag.NewFlagSet("put", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 2 || fs.NArg() > 3 {
+		return fmt.Errorf("usage: seavault put [--no-keychain] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	virtual := ""
+	if fs.NArg() == 3 {
+		virtual = fs.Arg(2)
+	}
+	results, err := v.PutPath(fs.Arg(1), virtual)
+	if err != nil {
+		return err
+	}
+	for _, r := range results {
+		fmt.Printf("put %-50s %10d bytes %4d chunks %4d new\n", r.Path, r.Size, r.ChunkCount, r.NewChunkCount)
+	}
+	return nil
+}
+
+func cmdGet(args []string) error {
+	fs := flag.NewFlagSet("get", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 3 {
+		return fmt.Errorf("usage: seavault get [--no-keychain] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_PATH")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	if err := v.GetPath(fs.Arg(1), fs.Arg(2)); err != nil {
+		return err
+	}
+	fmt.Printf("restored %s to %s\n", fs.Arg(1), fs.Arg(2))
+	return nil
+}
+
+func cmdList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: seavault list [--no-keychain] VAULT_DIR_OR_PROFILE")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	paths, err := v.List()
+	if err != nil {
+		return err
+	}
+	for _, p := range paths {
+		fmt.Println(p)
+	}
+	return nil
+}
+
+func cmdRemove(args []string) error {
+	fs := flag.NewFlagSet("remove", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return fmt.Errorf("usage: seavault remove [--no-keychain] VAULT_DIR_OR_PROFILE VIRTUAL_PATH")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	if err := v.Remove(fs.Arg(1)); err != nil {
+		return err
+	}
+	fmt.Println("removed", fs.Arg(1))
+	return nil
+}
+
+func cmdVerify(args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: seavault verify [--no-keychain] VAULT_DIR_OR_PROFILE")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	if err := v.Verify(); err != nil {
+		return err
+	}
+	fmt.Println("vault verified")
+	return nil
+}
+
+func cmdGC(args []string) error {
+	fs := flag.NewFlagSet("gc", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: seavault gc [--no-keychain] VAULT_DIR_OR_PROFILE")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	removed, err := v.GarbageCollect()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("removed %d unreferenced chunks\n", removed)
+	return nil
+}
+
+func cmdStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ExitOnError)
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: seavault stats [--no-keychain] VAULT_DIR_OR_PROFILE")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	s, err := v.Stats()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("files: %d\nreferenced chunks: %d\nstored chunk objects: %d\nreferenced MiB: %.2f\n", s.Files, s.Referenced, s.Objects, s.ReferencedMB)
+	return nil
+}
+
+func cmdServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:8765", "local address for the WebDAV-compatible endpoint")
+	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: seavault serve [--addr 127.0.0.1:8765] [--no-keychain] VAULT_DIR_OR_PROFILE")
+	}
+	vaultPath, err := resolveVaultArg(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	password, err := readPasswordForVault(vaultPath, !*noKeychain)
+	if err != nil {
+		return err
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("serving local WebDAV-compatible vault at http://%s/\n", *addr)
+	fmt.Println("bind is local by default; do not expose this listener on an untrusted network")
+	return http.ListenAndServe(*addr, localdav.New(v))
+}
+
+func cmdGUI(args []string) error {
+	fs := flag.NewFlagSet("gui", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:8787", "local address for the browser GUI")
+	noOpen := fs.Bool("no-open", false, "do not open the browser automatically")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	initial := ""
+	if fs.NArg() > 1 {
+		return fmt.Errorf("usage: seavault gui [--addr 127.0.0.1:8787] [--no-open] [VAULT_DIR_OR_PROFILE]")
+	}
+	if fs.NArg() == 1 {
+		initial = fs.Arg(0)
+	}
+	s, err := webui.New(initial)
+	if err != nil {
+		return err
+	}
+	url := "http://" + *addr + "/"
+	fmt.Printf("serving local GUI at %s\n", url)
+	fmt.Println("bind is local by default; do not expose this listener on an untrusted network")
+	if !*noOpen {
+		_ = openBrowser(url)
+	}
+	return http.ListenAndServe(*addr, s)
+}
+
+func cmdProfile(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: seavault profile add NAME VAULT_DIR | list | remove NAME")
+	}
+	switch args[0] {
+	case "add":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: seavault profile add NAME VAULT_DIR")
+		}
+		entry, err := profile.Add(args[1], args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("profile %s -> %s\n", entry.Name, entry.VaultPath)
+		return nil
+	case "list":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: seavault profile list")
+		}
+		entries, err := profile.Entries()
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			fmt.Printf("%s\t%s\n", e.Name, e.VaultPath)
+		}
+		return nil
+	case "remove", "rm":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault profile remove NAME")
+		}
+		return profile.Remove(args[1])
+	default:
+		return fmt.Errorf("unknown profile command %q", args[0])
+	}
+}
+
+func cmdKeychain(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: seavault keychain store VAULT_DIR_OR_PROFILE | status VAULT_DIR_OR_PROFILE | delete VAULT_DIR_OR_PROFILE")
+	}
+	switch args[0] {
+	case "store":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault keychain store VAULT_DIR_OR_PROFILE")
+		}
+		vaultPath, err := resolveVaultArg(args[1])
+		if err != nil {
+			return err
+		}
+		cfg, err := vault.ReadConfig(vaultPath)
+		if err != nil {
+			return err
+		}
+		password, err := readPasswordPrompt("Vault password to store in OS keychain: ")
+		if err != nil {
+			return err
+		}
+		if _, err := vault.Open(vaultPath, password); err != nil {
+			return err
+		}
+		if err := keychain.Set(cfg.VaultID, password); err != nil {
+			return err
+		}
+		fmt.Println("password stored in OS keychain")
+		return nil
+	case "status":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault keychain status VAULT_DIR_OR_PROFILE")
+		}
+		vaultPath, err := resolveVaultArg(args[1])
+		if err != nil {
+			return err
+		}
+		cfg, err := vault.ReadConfig(vaultPath)
+		if err != nil {
+			return err
+		}
+		if _, err := keychain.Get(cfg.VaultID); err != nil {
+			return err
+		}
+		fmt.Println("OS keychain entry exists")
+		return nil
+	case "delete", "remove", "rm":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault keychain delete VAULT_DIR_OR_PROFILE")
+		}
+		vaultPath, err := resolveVaultArg(args[1])
+		if err != nil {
+			return err
+		}
+		cfg, err := vault.ReadConfig(vaultPath)
+		if err != nil {
+			return err
+		}
+		if err := keychain.Delete(cfg.VaultID); err != nil {
+			return err
+		}
+		fmt.Println("OS keychain entry deleted")
+		return nil
+	default:
+		return fmt.Errorf("unknown keychain command %q", args[0])
+	}
+}
+
+func cmdRclone(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: seavault rclone status|install|check-update|update|rollback|version|path|verify-runtime")
+	}
+	ctx := context.Background()
+	installer := rclonebin.NewInstaller()
+	switch args[0] {
+	case "status":
+		fs := flag.NewFlagSet("rclone status", flag.ExitOnError)
+		check := fs.Bool("check-update", false, "also check the latest official rclone version")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return printJSON(installer.Status(ctx, *check))
+	case "install":
+		fs := flag.NewFlagSet("rclone install", flag.ExitOnError)
+		ver := fs.String("version", "", "rclone version to install; default latest stable")
+		channel := fs.String("channel", "stable", "release channel: stable or beta")
+		fromBinary := fs.String("from-binary", "", "register/copy an existing rclone-compatible binary into the managed runtime")
+		offlineArchive := fs.String("offline-archive", "", "install from a local rclone zip archive")
+		offlineSHA := fs.String("offline-sha256sums", "", "SHA256SUMS file for --offline-archive")
+		sig := fs.String("signature", "optional", "signature mode: optional, required, or skip")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		m, err := installer.Install(ctx, rclonebin.InstallOptions{Version: *ver, Channel: *channel, FromBinary: *fromBinary, OfflineArchive: *offlineArchive, OfflineSHA256: *offlineSHA, SignatureMode: *sig})
+		if printErr := printJSON(m); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "check-update":
+		fs := flag.NewFlagSet("rclone check-update", flag.ExitOnError)
+		channel := fs.String("channel", "stable", "release channel")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		li, err := installer.Latest(ctx, *channel)
+		if printErr := printJSON(li); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "update":
+		fs := flag.NewFlagSet("rclone update", flag.ExitOnError)
+		ver := fs.String("version", "", "rclone version to install; default latest")
+		channel := fs.String("channel", "", "release channel")
+		sig := fs.String("signature", "optional", "signature mode: optional, required, or skip")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		m, err := installer.Update(ctx, rclonebin.InstallOptions{Version: *ver, Channel: *channel, SignatureMode: *sig})
+		if printErr := printJSON(m); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "rollback":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: seavault rclone rollback")
+		}
+		m, err := rclonebin.Rollback()
+		if printErr := printJSON(m); printErr != nil && err == nil {
+			err = printErr
+		}
+		return err
+	case "version":
+		bin, err := rclonebin.BinaryPath()
+		if err != nil {
+			return err
+		}
+		v, err := rclonebin.Version(ctx, bin)
+		if err != nil {
+			return err
+		}
+		fmt.Println(v)
+		return nil
+	case "path":
+		bin, err := rclonebin.BinaryPath()
+		if err != nil {
+			return err
+		}
+		fmt.Println(bin)
+		return nil
+	case "verify-runtime":
+		m, err := rclonebin.LoadManifest()
+		if err != nil {
+			return err
+		}
+		if err := rclonebin.VerifyRuntime(m); err != nil {
+			return err
+		}
+		fmt.Println("managed rclone runtime verified")
+		return nil
+	default:
+		return fmt.Errorf("unknown rclone command %q", args[0])
+	}
+}
+
+func cmdRemote(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: seavault remote add|list|show|edit|delete|test|dry-run|push|pull|sync|check|config")
+	}
+	switch args[0] {
+	case "add", "edit":
+		fs := flag.NewFlagSet("remote "+args[0], flag.ExitOnError)
+		backend := fs.String("backend", "", "rclone backend label, e.g. local, sftp, s3, b2, onedrive, webdav")
+		typeName := fs.String("type", "rclone", "profile type: rclone or local")
+		configPath := fs.String("config", "", "rclone config path, default app-managed config")
+		transfers := fs.Int("transfers", 8, "parallel rclone transfers")
+		checkers := fs.Int("checkers", 16, "parallel rclone checkers")
+		fastList := fs.Bool("fast-list", true, "enable rclone --fast-list where supported")
+		bandwidth := fs.String("bwlimit", "", "optional rclone bandwidth limit")
+		allowSync := fs.Bool("allow-destructive-sync", false, "allow advanced destructive rclone sync for this profile")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 3 {
+			return fmt.Errorf("usage: seavault remote %s [flags] NAME VAULT_DIR_OR_PROFILE RCLONE_REMOTE_PATH", args[0])
+		}
+		vaultPath, err := resolveVaultArg(fs.Arg(1))
+		if err != nil {
+			return err
+		}
+		p := remotes.DefaultProfile(fs.Arg(0), vaultPath, fs.Arg(2), *backend)
+		p.Type = strings.ToLower(strings.TrimSpace(*typeName))
+		p.Remote.Transfers = *transfers
+		p.Remote.Checkers = *checkers
+		p.Remote.FastList = *fastList
+		p.Remote.BandwidthLimit = *bandwidth
+		if *configPath != "" {
+			cfg, err := remotes.ResolveConfigPath(*configPath)
+			if err != nil {
+				return err
+			}
+			p.Remote.RcloneConfigPath = cfg
+		}
+		p.Safety.AllowDestructiveSync = *allowSync
+		entry, err := remotes.Add(p)
+		if err != nil {
+			return err
+		}
+		return printJSON(entry)
+	case "list":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: seavault remote list")
+		}
+		entries, err := remotes.Entries()
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			fmt.Printf("%s\t%s\t%s\t%s\n", e.Name, e.Type, e.Vault, e.Remote.RemotePath)
+		}
+		return nil
+	case "show":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault remote show NAME")
+		}
+		p, ok, err := remotes.Get(args[1])
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("remote profile %q not found", args[1])
+		}
+		return printJSON(p)
+	case "delete", "remove", "rm":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault remote delete NAME")
+		}
+		return remotes.Remove(args[1])
+	case "test", "dry-run", "push", "pull", "check", "sync":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault remote %s NAME", args[0])
+		}
+		return runRemote(args[0], args[1])
+	case "config":
+		return cmdRemoteConfig(args[1:])
+	default:
+		return fmt.Errorf("unknown remote command %q", args[0])
+	}
+}
+
+func runRemote(op, name string) error {
+	ctx := context.Background()
+	p, ok, err := remotes.Get(name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("remote profile %q not found", name)
+	}
+	var res any
+	if p.Type == "local" {
+		t := localtransport.New(p)
+		switch op {
+		case "test":
+			res, err = t.Test(ctx)
+		case "dry-run":
+			res, err = t.DryRunPush(ctx)
+		case "push":
+			res, err = t.Push(ctx, transport.Options{})
+		case "pull":
+			res, err = t.Pull(ctx, transport.Options{})
+		case "check":
+			res, err = t.Check(ctx)
+		case "sync":
+			res, err = t.Sync(ctx, transport.Options{})
+		}
+	} else {
+		bin, err := rclonebin.BinaryPath()
+		if err != nil {
+			return err
+		}
+		t := rclonetransport.New(bin, p)
+		switch op {
+		case "test":
+			res, err = t.Test(ctx)
+		case "dry-run":
+			res, err = t.DryRunPush(ctx)
+		case "push":
+			res, err = t.Push(ctx, transport.Options{})
+		case "pull":
+			res, err = t.Pull(ctx, transport.Options{})
+		case "check":
+			res, err = t.Check(ctx)
+		case "sync":
+			if !p.Safety.AllowDestructiveSync {
+				return fmt.Errorf("destructive sync is disabled for %s; use push/pull/copy-safe flow or enable allowDestructiveSync after dry-run review", name)
+			}
+			return fmt.Errorf("destructive sync command is intentionally not automated; use copy-safe push/pull or vault-aware reconcile")
+		}
+	}
+	if err != nil {
+		if res != nil {
+			_ = printJSON(res)
+		}
+		return err
+	}
+	return printJSON(res)
+}
+
+func cmdRemoteConfig(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: seavault remote config path|import|export-redacted|validate")
+	}
+	switch args[0] {
+	case "path":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: seavault remote config path")
+		}
+		fmt.Println(remotes.DefaultRcloneConfigPath())
+		return nil
+	case "import":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault remote config import SOURCE_RCLONE_CONF")
+		}
+		src, err := userpath.Abs(args[1])
+		if err != nil {
+			return err
+		}
+		dst := remotes.DefaultRcloneConfigPath()
+		if err := copyFile(src, dst, 0o600); err != nil {
+			return err
+		}
+		fmt.Println("imported rclone config to", dst)
+		return nil
+	case "export-redacted":
+		if len(args) > 2 {
+			return fmt.Errorf("usage: seavault remote config export-redacted [CONFIG_PATH]")
+		}
+		cfg := remotes.DefaultRcloneConfigPath()
+		if len(args) == 2 {
+			var err error
+			cfg, err = userpath.Abs(args[1])
+			if err != nil {
+				return err
+			}
+		}
+		data, err := os.ReadFile(cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Println(remotes.RedactConfig(string(data)))
+		return nil
+	case "validate":
+		bin, err := rclonebin.BinaryPath()
+		if err != nil {
+			return err
+		}
+		cfg := remotes.DefaultRcloneConfigPath()
+		if len(args) == 2 {
+			cfg, err = userpath.Abs(args[1])
+			if err != nil {
+				return err
+			}
+		} else if len(args) != 1 {
+			return fmt.Errorf("usage: seavault remote config validate [CONFIG_PATH]")
+		}
+		out, err := exec.Command(bin, "--config", cfg, "config", "show").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("rclone config validate failed: %w: %s", err, strings.TrimSpace(remotes.RedactConfig(string(out))))
+		}
+		fmt.Println(remotes.RedactConfig(string(out)))
+		return nil
+	case "create":
+		_, err := remotes.EnsureManagedConfig()
+		if err != nil {
+			return err
+		}
+		fmt.Println(remotes.DefaultRcloneConfigPath())
+		return nil
+	default:
+		return fmt.Errorf("unknown remote config command %q", args[0])
+	}
+}
+
+func cmdSSHKey(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: seavault ssh-key generate NAME | list | public PRIVATE_KEY_OR_NAME | import NAME PRIVATE_KEY")
+	}
+	ctx := context.Background()
+	switch args[0] {
+	case "generate":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault ssh-key generate NAME")
+		}
+		info, err := sshkeys.Generate(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		return printJSON(info)
+	case "import":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: seavault ssh-key import NAME PRIVATE_KEY")
+		}
+		info, err := sshkeys.Import(args[1], args[2])
+		if err != nil {
+			return err
+		}
+		return printJSON(info)
+	case "public":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: seavault ssh-key public PRIVATE_KEY_OR_NAME")
+		}
+		pub, err := sshkeys.Public(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Println(pub)
+		return nil
+	case "list":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: seavault ssh-key list")
+		}
+		keys, err := sshkeys.List()
+		if err != nil {
+			return err
+		}
+		return printJSON(keys)
+	default:
+		return fmt.Errorf("unknown ssh-key command %q", args[0])
+	}
+}
+
+func printJSON(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+func copyFile(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func resolveVaultArg(input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", fmt.Errorf("vault path or profile is required")
+	}
+	if !strings.ContainsAny(input, `/\\`) && !filepath.IsAbs(input) {
+		if e, ok, err := profile.Resolve(input); err != nil {
+			return "", err
+		} else if ok {
+			return e.VaultPath, nil
+		}
+	}
+	return userpath.Abs(input)
+}
+
+func readPasswordForVault(vaultPath string, useKeychain bool) (string, error) {
+	if p := os.Getenv("SEAVAULT_PASSWORD"); p != "" {
+		return p, nil
+	}
+	if useKeychain {
+		if cfg, err := vault.ReadConfig(vaultPath); err == nil && cfg.VaultID != "" {
+			if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
+				return p, nil
+			}
+		}
+	}
+	return readPasswordPrompt("Vault password: ")
+}
+
+func readPasswordPrompt(prompt string) (string, error) {
+	if p := os.Getenv("SEAVAULT_PASSWORD"); p != "" {
+		return p, nil
+	}
+	return passphrase.Read(prompt)
+}
+
+func openBrowser(url string) error {
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		return exec.Command("open", url).Start()
+	default:
+		return exec.Command("xdg-open", url).Start()
+	}
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `seavault %s
+
+Cloud-folder client-side encrypted storage.
+
+Usage:
+  seavault init [flags] VAULT_DIR
+  seavault put [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
+  seavault get [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_PATH
+  seavault list [flags] VAULT_DIR_OR_PROFILE
+  seavault remove [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH
+  seavault verify [flags] VAULT_DIR_OR_PROFILE
+  seavault gc [flags] VAULT_DIR_OR_PROFILE
+  seavault stats [flags] VAULT_DIR_OR_PROFILE
+  seavault serve [flags] VAULT_DIR_OR_PROFILE
+  seavault gui [flags] [VAULT_DIR_OR_PROFILE]
+  seavault profile add NAME VAULT_DIR
+  seavault profile list
+  seavault profile remove NAME
+  seavault keychain store VAULT_DIR_OR_PROFILE
+  seavault keychain status VAULT_DIR_OR_PROFILE
+  seavault keychain delete VAULT_DIR_OR_PROFILE
+  seavault rclone status | install | check-update | update | rollback | verify-runtime
+  seavault remote add NAME VAULT_DIR_OR_PROFILE RCLONE_REMOTE_PATH
+  seavault remote list | show NAME | test NAME | dry-run NAME | push NAME | pull NAME | check NAME
+  seavault ssh-key generate NAME | list | public NAME | import NAME PRIVATE_KEY
+
+VAULT_DIR is the encrypted folder. Put it inside any local cloud-sync directory.
+Passwords are read from SEAVAULT_PASSWORD, then OS keychain, then a hidden prompt.
+`, version)
+}

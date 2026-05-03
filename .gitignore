@@ -1,0 +1,19 @@
+# build output
+bin/
+dist/
+*.exe
+*.test
+coverage.out
+
+# local vaults and recovered files
+*.vault/
+.seavault/
+recovered/
+
+# editor files
+.DS_Store
+.idea/
+.vscode/
+
+# default go build output
+/seavault
