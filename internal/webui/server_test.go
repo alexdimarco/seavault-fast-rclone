@@ -480,3 +480,136 @@ func TestVaultMoveAPIUpdatesSavedProfile(t *testing.T) {
 		t.Fatal("moved profile not found in status")
 	}
 }
+
+func davRequest(t *testing.T, s *Server, method, virtualPath string, body *bytes.Reader, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	if body == nil {
+		body = bytes.NewReader(nil)
+	}
+	urlPath := "/dav/" + s.token + "/" + strings.TrimPrefix(strings.ReplaceAll(virtualPath, "\\", "/"), "/")
+	req := httptest.NewRequest(method, urlPath, body)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestIntegratedWebDAVFileManagerSmoke(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initOpenTestVault(t, s)
+
+	filesReq := httptest.NewRequest(http.MethodGet, "/files/", nil)
+	filesRR := httptest.NewRecorder()
+	s.ServeHTTP(filesRR, filesReq)
+	if filesRR.Code != http.StatusOK {
+		t.Fatalf("/files failed: %d", filesRR.Code)
+	}
+	html := filesRR.Body.String()
+	for _, want := range []string{"WebDAV file manager", "davPropfind", "PROPFIND", "Drop files here", "copyDavURL", "webdavStatusBox"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("/files markup missing %q", want)
+		}
+	}
+
+	rr := davRequest(t, s, http.MethodPut, "docs/a.txt", bytes.NewReader([]byte("alpha")), nil)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("PUT failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, "MKCOL", "empty-folder", nil, nil)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("MKCOL failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, "PROPFIND", "", nil, map[string]string{"Depth": "1"})
+	if rr.Code != 207 {
+		t.Fatalf("PROPFIND root failed: %d %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "/docs/") {
+		t.Fatalf("PROPFIND root did not include docs folder: %s", rr.Body.String())
+	}
+	rr = davRequest(t, s, "PROPFIND", "docs", nil, map[string]string{"Depth": "1"})
+	if rr.Code != 207 || !strings.Contains(rr.Body.String(), "a.txt") {
+		t.Fatalf("PROPFIND nested failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, http.MethodGet, "docs/a.txt", nil, nil)
+	if rr.Code != http.StatusOK || rr.Body.String() != "alpha" {
+		t.Fatalf("GET failed: %d %q", rr.Code, rr.Body.String())
+	}
+	if cache := rr.Header().Get("Cache-Control"); !strings.Contains(cache, "no-store") {
+		t.Fatalf("GET missing no-store header: %q", cache)
+	}
+	rr = davRequest(t, s, "COPY", "docs/a.txt", nil, map[string]string{"Destination": "/dav/" + s.token + "/docs/b.txt"})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("COPY failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, "MOVE", "docs/b.txt", nil, map[string]string{"Destination": "/dav/" + s.token + "/docs/c.txt"})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("MOVE failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, http.MethodGet, "docs/c.txt", nil, nil)
+	if rr.Code != http.StatusOK || rr.Body.String() != "alpha" {
+		t.Fatalf("GET moved failed: %d %q", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/export-zip?path=docs&token="+s.token, nil)
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || rr.Header().Get("Content-Type") != "application/zip" {
+		t.Fatalf("ZIP download failed: %d content-type=%q body=%s", rr.Code, rr.Header().Get("Content-Type"), rr.Body.String())
+	}
+	rr = davRequest(t, s, http.MethodDelete, "docs/c.txt", nil, nil)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("DELETE failed: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestIntegratedWebDAVSecurityControls(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initOpenTestVault(t, s)
+
+	badReq := httptest.NewRequest("PROPFIND", "/dav/not-the-token/", nil)
+	badRR := httptest.NewRecorder()
+	s.ServeHTTP(badRR, badReq)
+	if badRR.Code != http.StatusForbidden {
+		t.Fatalf("expected token rejection, got %d", badRR.Code)
+	}
+
+	rr := davRequest(t, s, http.MethodPut, ".seavault/evil", bytes.NewReader([]byte("x")), nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected .seavault rejection, got %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, http.MethodPut, "../evil", bytes.NewReader([]byte("x")), nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected traversal rejection, got %d %s", rr.Code, rr.Body.String())
+	}
+
+	rr = postJSON(t, s, "/api/webdav", map[string]any{"readOnly": true})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("set readonly failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, http.MethodPut, "docs/readonly.txt", bytes.NewReader([]byte("x")), nil)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected readonly write rejection, got %d %s", rr.Code, rr.Body.String())
+	}
+
+	oldToken := s.token
+	rr = postJSON(t, s, "/api/close", map[string]any{})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("close failed: %d %s", rr.Code, rr.Body.String())
+	}
+	if s.token == oldToken {
+		t.Fatal("expected token rotation on close")
+	}
+	closedReq := httptest.NewRequest("PROPFIND", "/dav/"+s.token+"/", nil)
+	closedRR := httptest.NewRecorder()
+	s.ServeHTTP(closedRR, closedReq)
+	if closedRR.Code != http.StatusConflict {
+		t.Fatalf("expected WebDAV stopped when vault closes, got %d", closedRR.Code)
+	}
+}
