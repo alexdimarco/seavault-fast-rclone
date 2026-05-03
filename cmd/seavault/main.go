@@ -19,6 +19,7 @@ import (
 	"github.com/example/seavault-fast/internal/profile"
 	"github.com/example/seavault-fast/internal/rclonebin"
 	"github.com/example/seavault-fast/internal/remotes"
+	"github.com/example/seavault-fast/internal/rsyncingest"
 	"github.com/example/seavault-fast/internal/sshkeys"
 	"github.com/example/seavault-fast/internal/transport"
 	localtransport "github.com/example/seavault-fast/internal/transport/local"
@@ -28,7 +29,7 @@ import (
 	"github.com/example/seavault-fast/internal/webui"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -64,6 +65,8 @@ func main() {
 		err = cmdKeychain(os.Args[2:])
 	case "rclone":
 		err = cmdRclone(os.Args[2:])
+	case "rsync":
+		err = cmdRsync(os.Args[2:])
 	case "remote":
 		err = cmdRemote(os.Args[2:])
 	case "ssh-key":
@@ -150,11 +153,13 @@ func cmdInit(args []string) error {
 func cmdPut(args []string) error {
 	fs := flag.NewFlagSet("put", flag.ExitOnError)
 	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+	ingestMode := fs.String("ingest", "auto", "ingestion method: auto, rsync, or direct")
+	rsyncBin := fs.String("rsync-bin", "", "optional rsync binary path; default SEAVAULT_RSYNC or PATH")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 2 || fs.NArg() > 3 {
-		return fmt.Errorf("usage: seavault put [--no-keychain] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
+		return fmt.Errorf("usage: seavault put [--no-keychain] [--ingest auto|rsync|direct] [--rsync-bin PATH] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
 	}
 	vaultPath, err := resolveVaultArg(fs.Arg(0))
 	if err != nil {
@@ -172,11 +177,19 @@ func cmdPut(args []string) error {
 	if fs.NArg() == 3 {
 		virtual = fs.Arg(2)
 	}
-	results, err := v.PutPath(fs.Arg(1), virtual)
+	result, err := rsyncingest.PutPath(context.Background(), v, fs.Arg(1), virtual, rsyncingest.Options{Mode: *ingestMode, RsyncPath: *rsyncBin, PreserveRootOnEmpty: true})
 	if err != nil {
 		return err
 	}
-	for _, r := range results {
+	if result.Report.Warning != "" {
+		fmt.Fprintln(os.Stderr, "warning:", result.Report.Warning)
+	}
+	if result.Report.UsedRsync {
+		fmt.Fprintf(os.Stderr, "ingest: rsync staged source using %s\n", result.Report.RsyncPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "ingest: %s\n", result.Report.Mode)
+	}
+	for _, r := range result.Results {
 		fmt.Printf("put %-50s %10d bytes %4d chunks %4d new\n", r.Path, r.Size, r.ChunkCount, r.NewChunkCount)
 	}
 	return nil
@@ -511,6 +524,26 @@ func cmdKeychain(args []string) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown keychain command %q", args[0])
+	}
+}
+
+func cmdRsync(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: seavault rsync status [--rsync-bin PATH]")
+	}
+	switch args[0] {
+	case "status", "version":
+		fs := flag.NewFlagSet("rsync status", flag.ExitOnError)
+		rsyncBin := fs.String("rsync-bin", "", "optional rsync binary path; default SEAVAULT_RSYNC or PATH")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 {
+			return fmt.Errorf("usage: seavault rsync status [--rsync-bin PATH]")
+		}
+		return printJSON(rsyncingest.Status(*rsyncBin))
+	default:
+		return fmt.Errorf("unknown rsync command %q", args[0])
 	}
 }
 
@@ -959,6 +992,7 @@ Cloud-folder client-side encrypted storage.
 Usage:
   seavault init [flags] VAULT_DIR
   seavault put [flags] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]
+  seavault rsync status [--rsync-bin PATH]
   seavault get [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH DEST_PATH
   seavault list [flags] VAULT_DIR_OR_PROFILE
   seavault remove [flags] VAULT_DIR_OR_PROFILE VIRTUAL_PATH
@@ -974,6 +1008,7 @@ Usage:
   seavault keychain status VAULT_DIR_OR_PROFILE
   seavault keychain delete VAULT_DIR_OR_PROFILE
   seavault rclone status | install | check-update | update | rollback | verify-runtime
+  seavault rsync status
   seavault remote add NAME VAULT_DIR_OR_PROFILE RCLONE_REMOTE_PATH
   seavault remote list | show NAME | test NAME | dry-run NAME | push NAME | pull NAME | check NAME
   seavault ssh-key generate NAME | list | public NAME | import NAME PRIVATE_KEY

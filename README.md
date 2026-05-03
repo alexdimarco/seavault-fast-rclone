@@ -164,3 +164,23 @@ GOOS=windows GOARCH=amd64 go build -o dist/seavault-windows-amd64.exe ./cmd/seav
 ## Security boundary
 
 SeaVault protects file contents and virtual paths before the vault is synchronized. It does not hide total vault size, approximate object count, object churn, sync timing, or the existence of the vault from the cloud provider.
+
+## Rsync-backed archive ingestion
+
+`seavault put` now stages local files or folders with rsync before chunking and encrypting them into the vault when rsync is available. This gives a stable local mirror for large folder imports while keeping the encrypted vault layout unchanged.
+
+```bash
+seavault rsync status
+seavault put --ingest rsync ~/Nextcloud/seavault ./project-folder projects/project-folder
+seavault put --ingest auto ~/Nextcloud/seavault ./report.pdf reports/report.pdf
+```
+
+Ingest modes:
+
+| Mode | Behaviour |
+|---|---|
+| `auto` | Use rsync when available, otherwise use direct ingestion fallback. |
+| `rsync` | Require rsync and fail if unavailable. |
+| `direct` | Bypass rsync. |
+
+Use `SEAVAULT_RSYNC` or `--rsync-bin` to point at a specific rsync executable. The GUI Upload panel includes the same method selector and supports browser folder upload with relative path preservation. On Windows, `auto` mode falls back to direct ingestion unless a compatible rsync binary is available. Rsync is only used for local plaintext staging before encryption; remote cloud transport remains rclone-based.

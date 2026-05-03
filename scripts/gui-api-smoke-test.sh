@@ -53,4 +53,18 @@ post_json /api/close '{}' | grep -q '"ok":true'
 post_json /api/open "{\"vaultPath\":\"$VAULT\",\"password\":\"$PASSWORD\",\"profile\":\"ignored-old-form-field\",\"kdf\":\"scrypt\",\"savePassword\":false,\"useKeychain\":false}" | grep -q '"opened":true'
 curl -fsS "$URL/api/status" | grep -q '"open":true'
 
+mkdir -p "$WORK/upload/folder/sub"
+printf 'alpha folder upload\n' > "$WORK/upload/folder/a.txt"
+printf 'bravo folder upload\n' > "$WORK/upload/folder/sub/b.txt"
+curl -fsS \
+  -H "X-SeaVault-Token: $TOKEN" \
+  -F 'path=archive/' \
+  -F 'ingestMode=rsync' \
+  -F "files=@$WORK/upload/folder/a.txt;filename=a.txt" \
+  -F 'relativePaths=folder/a.txt' \
+  -F "files=@$WORK/upload/folder/sub/b.txt;filename=b.txt" \
+  -F 'relativePaths=folder/sub/b.txt' \
+  "$URL/api/upload" | grep -q '"usedRsync":true'
+curl -fsS "$URL/api/files" | grep -q 'archive/folder/sub/b.txt'
+
 echo 'GUI API smoke test passed'

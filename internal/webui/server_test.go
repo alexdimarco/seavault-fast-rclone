@@ -3,8 +3,11 @@ package webui
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -189,5 +192,94 @@ func TestRcloneRemoteAndSSHKeyAPIs(t *testing.T) {
 	}
 	if !strings.HasPrefix(pub["publicKey"], "ssh-ed25519 ") {
 		t.Fatalf("unexpected public key: %q", pub["publicKey"])
+	}
+}
+
+func TestUploadFolderUsesRsyncAndPreservesRelativePaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake rsync script is POSIX-only")
+	}
+	rsync := filepath.Join(t.TempDir(), "rsync")
+	script := `#!/usr/bin/env sh
+set -eu
+if [ "${1:-}" = "--version" ]; then echo 'rsync  version 3.4.1'; exit 0; fi
+src=''
+dst=''
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    *) src="$dst"; dst="$arg" ;;
+  esac
+done
+mkdir -p "$dst"
+case "$src" in
+  */) cp -R "$src". "$dst"/ ;;
+  *) cp "$src" "$dst"/ ;;
+esac
+`
+	if err := os.WriteFile(rsync, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultPath := filepath.Join(t.TempDir(), "cloud", "seavault")
+	rr := postJSON(t, s, "/api/init", map[string]any{
+		"vaultPath": vaultPath,
+		"password":  "passphrase",
+		"kdf":       "scrypt",
+		"scryptN":   16,
+		"scryptR":   1,
+		"scryptP":   1,
+	})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("init failed: %d %s", rr.Code, rr.Body.String())
+	}
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("path", "archive/")
+	_ = mw.WriteField("ingestMode", "rsync")
+	_ = mw.WriteField("rsyncBin", rsync)
+	part, err := mw.CreateFormFile("files", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(part, "alpha")
+	_ = mw.WriteField("relativePaths", "folder/a.txt")
+	part, err = mw.CreateFormFile("files", "b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(part, "bravo")
+	_ = mw.WriteField("relativePaths", "folder/sub/b.txt")
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-SeaVault-Token", s.token)
+	rr = httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upload failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var upload uploadResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &upload); err != nil {
+		t.Fatal(err)
+	}
+	if !upload.Ingest.UsedRsync {
+		t.Fatalf("expected rsync ingestion, got %#v", upload.Ingest)
+	}
+	files, err := s.vault.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(files, "\n")
+	if !strings.Contains(got, "archive/folder/a.txt") || !strings.Contains(got, "archive/folder/sub/b.txt") {
+		t.Fatalf("unexpected files: %v", files)
 	}
 }

@@ -10,17 +10,18 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/example/seavault-fast/internal/keychain"
 	"github.com/example/seavault-fast/internal/profile"
 	"github.com/example/seavault-fast/internal/rclonebin"
 	"github.com/example/seavault-fast/internal/remotes"
+	"github.com/example/seavault-fast/internal/rsyncingest"
 	"github.com/example/seavault-fast/internal/sshkeys"
 	"github.com/example/seavault-fast/internal/transport"
 	localtransport "github.com/example/seavault-fast/internal/transport/local"
@@ -134,7 +135,9 @@ type fileDTO struct {
 }
 
 type uploadResponse struct {
-	Results []vault.PutResult `json:"results"`
+	Results []vault.PutResult  `json:"results"`
+	Ingest  rsyncingest.Report `json:"ingest"`
+	Count   int                `json:"count"`
 }
 
 func New(initialVault string) (*Server, error) {
@@ -196,6 +199,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleProfile(w, r)
 	case "/api/rclone/status":
 		s.handleRcloneStatus(w, r)
+	case "/api/rsync/status":
+		s.handleRsyncStatus(w, r)
 	case "/api/rclone/install":
 		s.handleRcloneInstall(w, r)
 	case "/api/rclone/update":
@@ -397,11 +402,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := r.ParseMultipartForm(256 << 20); err != nil {
+	if err := r.ParseMultipartForm(512 << 20); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
 		return
 	}
 	basePath := strings.TrimSpace(r.FormValue("path"))
+	ingestMode := strings.TrimSpace(r.FormValue("ingestMode"))
+	rsyncBin := strings.TrimSpace(r.FormValue("rsyncBin"))
 	files := r.MultipartForm.File["files"]
 	if len(files) == 0 {
 		files = r.MultipartForm.File["file"]
@@ -410,28 +417,71 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, apiError{Error: "no uploaded file field named file or files"})
 		return
 	}
-	var results []vault.PutResult
+	relativePaths := r.MultipartForm.Value["relativePaths"]
+	tmpRoot, err := os.MkdirTemp("", "seavault-upload-*")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+		return
+	}
+	defer os.RemoveAll(tmpRoot)
+
+	written := make([]string, 0, len(files))
+	for i, fh := range files {
+		rel := ""
+		if i < len(relativePaths) {
+			rel = relativePaths[i]
+		}
+		if strings.TrimSpace(rel) == "" {
+			rel = fh.Filename
+		}
+		rel = strings.ReplaceAll(rel, "\\", "/")
+		rel = strings.TrimLeft(rel, "/")
+		cleanRel, err := vault.CleanVirtualPath(rel)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid upload relative path " + rel + ": " + err.Error()})
+			return
+		}
+		target := filepath.Join(tmpRoot, filepath.FromSlash(cleanRel))
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+			return
+		}
+		src, err := fh.Open()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+			return
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, err = io.Copy(out, src)
+		}
+		closeErr := outClose(out)
+		_ = src.Close()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+			return
+		}
+		if closeErr != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError{Error: closeErr.Error()})
+			return
+		}
+		written = append(written, cleanRel)
+	}
+
+	singleExact := len(written) == 1 && strings.TrimSpace(basePath) != "" && !strings.HasSuffix(strings.TrimSpace(basePath), "/") && !strings.Contains(written[0], "/")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, fh := range files {
-		f, err := fh.Open()
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
-			return
-		}
-		virtualPath := strings.TrimSpace(basePath)
-		if virtualPath == "" || len(files) > 1 || strings.HasSuffix(virtualPath, "/") {
-			virtualPath = path.Join(strings.TrimSuffix(basePath, "/"), filepath.Base(fh.Filename))
-		}
-		res, err := v.PutReader(f, virtualPath, fh.Size, 0o600, time.Now().UTC())
-		_ = f.Close()
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
-			return
-		}
-		results = append(results, res)
+	var result rsyncingest.Result
+	if singleExact {
+		result, err = rsyncingest.PutPath(r.Context(), v, filepath.Join(tmpRoot, filepath.FromSlash(written[0])), basePath, rsyncingest.Options{Mode: ingestMode, RsyncPath: rsyncBin, PreserveRootOnEmpty: false})
+	} else {
+		result, err = rsyncingest.PutDirectoryContents(r.Context(), v, tmpRoot, strings.TrimSuffix(basePath, "/"), rsyncingest.Options{Mode: ingestMode, RsyncPath: rsyncBin})
 	}
-	writeJSON(w, http.StatusOK, uploadResponse{Results: results})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "ingest": result.Report})
+		return
+	}
+	writeJSON(w, http.StatusOK, uploadResponse{Results: result.Results, Ingest: result.Report, Count: len(result.Results)})
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -577,6 +627,14 @@ func (s *Server) handleRcloneStatus(w http.ResponseWriter, r *http.Request) {
 	check := r.URL.Query().Get("checkUpdate") == "1" || strings.EqualFold(r.URL.Query().Get("checkUpdate"), "true")
 	status := rclonebin.NewInstaller().Status(r.Context(), check)
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleRsyncStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, rsyncingest.Status(r.URL.Query().Get("rsyncBin")))
 }
 
 func (s *Server) handleRcloneInstall(w http.ResponseWriter, r *http.Request) {
@@ -812,6 +870,13 @@ func (s *Server) handleSSHKeyPublic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"publicKey": pub})
 }
 
+func outClose(f *os.File) error {
+	if f == nil {
+		return nil
+	}
+	return f.Close()
+}
+
 func (s *Server) currentVault(w http.ResponseWriter) (*vault.Vault, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -967,17 +1032,33 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid color-mix(in s
 </section>
 
 <section>
-  <h2>Upload</h2>
+  <h2>Upload into encrypted archive</h2>
+  <p><small>Uploads are staged with rsync when available, then chunked and encrypted into the vault. Browser folder upload preserves relative paths; plaintext is removed from the temporary staging area after import.</small></p>
   <div class="grid">
     <label>Virtual path or folder
       <input id="uploadPath" placeholder="reports/">
-      <small>Use a trailing slash or select multiple files to upload under a folder.</small>
+      <small>For one file, use an exact path such as reports/a.pdf. For multiple files or folders, use a folder prefix such as reports/.</small>
     </label>
     <label>Files
       <input id="fileInput" type="file" multiple>
     </label>
+    <label>Folder
+      <input id="folderInput" type="file" multiple webkitdirectory directory>
+      <small>Supported by Chromium, Edge, and Safari. Firefox may not expose folder selection.</small>
+    </label>
+    <label>Ingest method
+      <select id="ingestMode">
+        <option value="auto">auto: rsync if available, otherwise direct</option>
+        <option value="rsync">require rsync</option>
+        <option value="direct">direct fallback</option>
+      </select>
+    </label>
+    <label>rsync binary path
+      <input id="rsyncBin" placeholder="optional; default SEAVAULT_RSYNC or PATH">
+    </label>
   </div>
-  <p><button onclick="uploadFiles()">Upload selected files</button></p>
+  <p class="row-actions"><button onclick="uploadFiles()">Upload selected files/folder</button><button onclick="rsyncStatus()">Check rsync</button></p>
+  <pre id="uploadOutput">No upload has run.</pre>
 </section>
 
 <section>
@@ -1094,6 +1175,7 @@ async function api(path, opts={}){
   return body;
 }
 function show(obj){ $('status').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
+function uploadShow(obj){ $('uploadOutput').textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
 function fillPath(p){ $('vaultPath').value = p; }
 function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
 function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
@@ -1101,32 +1183,27 @@ function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/u
 async function refreshStatus(){ try { const s = await api('/api/status'); show(s); await refreshFiles(); await loadProfiles(); } catch(e){ show(e.message); } }
 async function initVault(){ try { const warn = localPathWarning(); if(warn){ show(warn); return; } const res = await api('/api/init',{method:'POST',headers,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; show(status); await refreshFiles(); await loadProfiles(); } catch(e){ show(e.message); } }
 async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ show(warn); return; } const res = await api('/api/open',{method:'POST',headers,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; show(status); await refreshFiles(); await loadProfiles(); } catch(e){ show(e.message); } }
-async function closeVault(){ try { await api('/api/close',{method:'POST',headers,body:'{}'}); await 
-async function rcloneStatus(check){ try { const s = await api('/api/rclone/status?checkUpdate='+(check?'1':'0')); $('rcloneStatus').textContent = JSON.stringify(s,null,2); } catch(e){ $('rcloneStatus').textContent = e.message; } }
-async function rcloneInstall(){ try { const req={version:$('rcloneVersion').value, channel:'stable', fromBinary:$('rcloneFromBinary').value, signature:$('rcloneSignature').value}; const res=await api('/api/rclone/install',{method:'POST',headers,body:JSON.stringify(req)}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); } catch(e){ $('rcloneStatus').textContent=e.message; } }
-async function rcloneUpdate(){ try { const req={version:$('rcloneVersion').value, channel:'stable', signature:$('rcloneSignature').value}; const res=await api('/api/rclone/update',{method:'POST',headers,body:JSON.stringify(req)}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); } catch(e){ $('rcloneStatus').textContent=e.message; } }
-async function rcloneRollback(){ try { const res=await api('/api/rclone/rollback',{method:'POST',headers,body:'{}'}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); } catch(e){ $('rcloneStatus').textContent=e.message; } }
-function remotePayload(){ return {name:$('remoteName').value,type:$('remoteType').value,vaultPath:$('remoteVault').value,remotePath:$('remotePath').value,backend:$('remoteBackend').value,transfers:Number($('remoteTransfers').value||8),checkers:Number($('remoteCheckers').value||16),fastList:$('remoteFastList').checked,bandwidth:$('remoteBandwidth').value}; }
-async function saveRemote(){ try { const res=await api('/api/remote',{method:'POST',headers,body:JSON.stringify(remotePayload())}); $('remoteOutput').textContent=JSON.stringify(res,null,2); await loadRemotes(); } catch(e){ $('remoteOutput').textContent=e.message; } }
-async function loadRemotes(){ try { const data=await api('/api/remotes'); const rows=data.remotes||[]; $('remotes').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Type</th><th>Vault</th><th>Remote</th><th>Actions</th></tr></thead><tbody>'+rows.map(r=>'<tr><td>'+esc(r.name)+'</td><td>'+esc(r.type)+'</td><td class="path">'+esc(r.vault)+'</td><td class="path">'+esc(r.remote.remotePath)+'</td><td class="row-actions"><button onclick="remoteRun(\''+escAttr(r.name)+'\',\'test\')">Test</button><button onclick="remoteRun(\''+escAttr(r.name)+'\',\'dry-run\')">Dry-run</button><button onclick="remoteRun(\''+escAttr(r.name)+'\',\'push\')">Push</button><button onclick="remoteRun(\''+escAttr(r.name)+'\',\'pull\')">Pull</button><button onclick="remoteRun(\''+escAttr(r.name)+'\',\'check\')">Check</button><button class="danger" onclick="deleteRemote(\''+escAttr(r.name)+'\')">Delete</button></td></tr>').join('')+'</tbody></table>' : '<p>No remote profiles saved.</p>'; } catch(e){ $('remotes').innerHTML='<p>'+esc(e.message)+'</p>'; } }
-async function remoteRun(name,operation){ try { const res=await api('/api/remote-run',{method:'POST',headers,body:JSON.stringify({name,operation})}); $('remoteOutput').textContent=JSON.stringify(res,null,2); } catch(e){ $('remoteOutput').textContent=e.message; } }
-async function deleteRemote(name){ try { const res=await api('/api/remote?name='+encodeURIComponent(name),{method:'DELETE',headers}); $('remoteOutput').textContent=JSON.stringify(res,null,2); await loadRemotes(); } catch(e){ $('remoteOutput').textContent=e.message; } }
-async function generateSSHKey(){ try { const res=await api('/api/ssh-keys',{method:'POST',headers,body:JSON.stringify({name:$('sshKeyName').value,path:$('sshKeyPath').value})}); $('remoteOutput').textContent=JSON.stringify(res,null,2); await loadSSHKeys(); } catch(e){ $('remoteOutput').textContent=e.message; } }
-async function loadSSHKeys(){ try { const data=await api('/api/ssh-keys'); const rows=data.keys||[]; $('sshKeys').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Private key</th><th>Public key</th><th>Actions</th></tr></thead><tbody>'+rows.map(k=>'<tr><td>'+esc(k.name)+'</td><td class="path">'+esc(k.privatePath)+'</td><td class="path">'+esc(k.publicPath)+'</td><td><button onclick="showPublicKey(\''+escAttr(k.name)+'\')">Show public key</button></td></tr>').join('')+'</tbody></table>' : '<p>No managed SSH keys.</p>'; } catch(e){ $('sshKeys').innerHTML='<p>'+esc(e.message)+'</p>'; } }
-async function showPublicKey(name){ try { const res=await api('/api/ssh-key-public?name='+encodeURIComponent(name)); $('remoteOutput').textContent=res.publicKey; } catch(e){ $('remoteOutput').textContent=e.message; } }
-function escAttr(s){ return String(s).replace(/[\\'"&<>]/g, c => ({'\\':'\\\\',"'":"\\'",'"':'&quot;','&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-
-refreshStatus(); rcloneStatus(false); loadRemotes(); loadSSHKeys(); } catch(e){ show(e.message); } }
+async function closeVault(){ try { await api('/api/close',{method:'POST',headers,body:'{}'}); await refreshStatus(); } catch(e){ show(e.message); } }
 async function uploadFiles(){
   try {
     const fd = new FormData();
     fd.append('path', $('uploadPath').value);
-    for(const f of $('fileInput').files) fd.append('files', f, f.name);
+    fd.append('ingestMode', $('ingestMode').value);
+    fd.append('rsyncBin', $('rsyncBin').value);
+    const files = [...$('fileInput').files];
+    const folders = [...$('folderInput').files];
+    const all = files.concat(folders);
+    if(all.length === 0) throw new Error('Select one or more files or a folder first.');
+    for(const f of all){
+      const rel = f.webkitRelativePath || f.name;
+      fd.append('files', f, f.name);
+      fd.append('relativePaths', rel);
+    }
     const res = await fetch('/api/upload',{method:'POST',headers:{'X-SeaVault-Token':token},body:fd});
     const body = await res.json();
     if(!res.ok) throw new Error(body.error || res.statusText);
-    show(body); $('fileInput').value=''; await refreshFiles();
-  } catch(e){ show(e.message); }
+    uploadShow(body); $('fileInput').value=''; $('folderInput').value=''; await refreshFiles();
+  } catch(e){ uploadShow(e.message); }
 }
 async function refreshFiles(){
   try {
@@ -1145,8 +1222,7 @@ async function loadProfiles(){
   try { const data = await api('/api/profiles'); const rows = data.profiles || []; $('profiles').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Vault path</th></tr></thead><tbody>'+rows.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="path">'+esc(p.vaultPath)+'</td></tr>').join('')+'</tbody></table>' : '<p>No profiles saved.</p>'; }
   catch(e){ $('profiles').innerHTML = '<p>'+esc(e.message)+'</p>'; }
 }
-function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
+async function rsyncStatus(){ try { const s = await api('/api/rsync/status?rsyncBin='+encodeURIComponent($('rsyncBin').value)); uploadShow(s); } catch(e){ uploadShow(e.message); } }
 async function rcloneStatus(check){ try { const s = await api('/api/rclone/status?checkUpdate='+(check?'1':'0')); $('rcloneStatus').textContent = JSON.stringify(s,null,2); } catch(e){ $('rcloneStatus').textContent = e.message; } }
 async function rcloneInstall(){ try { const req={version:$('rcloneVersion').value, channel:'stable', fromBinary:$('rcloneFromBinary').value, signature:$('rcloneSignature').value}; const res=await api('/api/rclone/install',{method:'POST',headers,body:JSON.stringify(req)}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); } catch(e){ $('rcloneStatus').textContent=e.message; } }
 async function rcloneUpdate(){ try { const req={version:$('rcloneVersion').value, channel:'stable', signature:$('rcloneSignature').value}; const res=await api('/api/rclone/update',{method:'POST',headers,body:JSON.stringify(req)}); $('rcloneStatus').textContent=JSON.stringify(res,null,2); } catch(e){ $('rcloneStatus').textContent=e.message; } }
@@ -1159,8 +1235,8 @@ async function deleteRemote(name){ try { const res=await api('/api/remote?name='
 async function generateSSHKey(){ try { const res=await api('/api/ssh-keys',{method:'POST',headers,body:JSON.stringify({name:$('sshKeyName').value,path:$('sshKeyPath').value})}); $('remoteOutput').textContent=JSON.stringify(res,null,2); await loadSSHKeys(); } catch(e){ $('remoteOutput').textContent=e.message; } }
 async function loadSSHKeys(){ try { const data=await api('/api/ssh-keys'); const rows=data.keys||[]; $('sshKeys').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Private key</th><th>Public key</th><th>Actions</th></tr></thead><tbody>'+rows.map(k=>'<tr><td>'+esc(k.name)+'</td><td class="path">'+esc(k.privatePath)+'</td><td class="path">'+esc(k.publicPath)+'</td><td><button onclick="showPublicKey(\''+escAttr(k.name)+'\')">Show public key</button></td></tr>').join('')+'</tbody></table>' : '<p>No managed SSH keys.</p>'; } catch(e){ $('sshKeys').innerHTML='<p>'+esc(e.message)+'</p>'; } }
 async function showPublicKey(name){ try { const res=await api('/api/ssh-key-public?name='+encodeURIComponent(name)); $('remoteOutput').textContent=res.publicKey; } catch(e){ $('remoteOutput').textContent=e.message; } }
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function escAttr(s){ return String(s).replace(/[\\'"&<>]/g, c => ({'\\':'\\\\',"'":"\\'",'"':'&quot;','&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-
 refreshStatus(); rcloneStatus(false); loadRemotes(); loadSSHKeys();
 </script>
 </body>
