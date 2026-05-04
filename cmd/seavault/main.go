@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/example/seavault-fast/internal/appconfig"
 	"github.com/example/seavault-fast/internal/importer"
@@ -362,11 +363,44 @@ func cmdVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := v.Verify(); err != nil {
+	report, err := v.VerifyReport()
+	if err != nil {
 		return err
 	}
-	fmt.Println("vault verified")
+	printVerifyReport(report)
+	if !report.OK {
+		return &vault.VerifyError{Report: report}
+	}
 	return nil
+}
+
+func printVerifyReport(report vault.VerifyReport) {
+	status := "FAILED"
+	if report.OK {
+		status = "PASSED"
+	}
+	fmt.Printf("vault verification %s\n", status)
+	fmt.Printf("files checked: %d\n", report.FilesChecked)
+	fmt.Printf("chunks checked: %d\n", report.ChunksChecked)
+	fmt.Printf("referenced bytes checked: %d\n", report.BytesChecked)
+	if len(report.Issues) == 0 {
+		return
+	}
+	fmt.Printf("issues: %d (missing chunks: %d, corrupt chunks: %d, other errors: %d)\n", len(report.Issues), report.MissingChunks, report.CorruptChunks, report.OtherErrors)
+	for i, issue := range report.Issues {
+		fmt.Printf("\nissue %d:\n", i+1)
+		fmt.Printf("  kind: %s\n", issue.Kind)
+		if issue.Path != "" {
+			fmt.Printf("  file: %s\n", issue.Path)
+		}
+		if issue.ChunkID != "" {
+			fmt.Printf("  chunk: %s\n", issue.ChunkID)
+		}
+		if issue.ChunkPath != "" {
+			fmt.Printf("  chunk path: %s\n", issue.ChunkPath)
+		}
+		fmt.Printf("  error: %s\n", issue.Error)
+	}
 }
 
 func cmdGC(args []string) error {
@@ -527,6 +561,7 @@ func cmdGUI(args []string) error {
 	fs := flag.NewFlagSet("gui", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8787", "local address for the browser GUI")
 	noOpen := fs.Bool("no-open", false, "do not open the browser automatically")
+	exitOnBrowserClose := fs.Bool("exit-on-browser-close", true, "best-effort: stop the GUI after the browser page stops sending heartbeats; set --exit-on-browser-close=false to keep the server running")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -568,13 +603,38 @@ func cmdGUI(args []string) error {
 	url := scheme + "://" + *addr + "/"
 	fmt.Printf("serving local GUI at %s\n", url)
 	fmt.Println("bind is local by default; do not expose this listener on an untrusted network")
+	if *exitOnBrowserClose {
+		s.EnableBrowserCloseShutdown(10 * time.Second)
+		fmt.Println("exit-on-browser-close enabled; the GUI will stop shortly after the browser page closes")
+	}
 	if !*noOpen {
 		_ = openBrowser(url)
 	}
-	if scheme == "https" {
-		return http.ListenAndServeTLS(*addr, cfg.GUI.CertFile, cfg.GUI.KeyFile, s)
+	srv := &http.Server{Addr: *addr, Handler: s}
+	serveErr := make(chan error, 1)
+	go func() {
+		if scheme == "https" {
+			serveErr <- srv.ListenAndServeTLS(cfg.GUI.CertFile, cfg.GUI.KeyFile)
+			return
+		}
+		serveErr <- srv.ListenAndServe()
+	}()
+	select {
+	case err := <-serveErr:
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
+	case <-s.ShutdownNotify():
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		err := <-serveErr
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
 	}
-	return http.ListenAndServe(*addr, s)
 }
 
 func cmdMove(args []string) error {

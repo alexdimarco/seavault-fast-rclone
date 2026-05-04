@@ -53,3 +53,15 @@ You may add Your own copyright statement to Your modifications and may provide a
 9. Accepting Warranty or Additional Liability. While redistributing the Work or Derivative Works thereof, You may choose to offer, and charge a fee for, acceptance of support, warranty, indemnity, or other liability obligations. However, in accepting such obligations, You may act only on Your own behalf and on Your sole responsibility, not on behalf of any other Contributor, and only if You agree to indemnify, defend, and hold each Contributor harmless for any liability incurred by, or claims asserted against, such Contributor by reason of your accepting any such warranty or additional liability.
 
 END OF TERMS AND CONDITIONS
+
+BRANDING AND TRADEMARK RESERVATION ADDENDUM
+
+The Apache License above applies to the software code only, except where a file or directory states otherwise. No license is granted to use any company name, project name, product name, trade name, trademark, service mark, logo, icon, visual identity, design mark, colour system, domain name, slogan, or other branding element associated with the Licensor, Crescendum, SeaVault, SeaVault Fast, or Encrypted File Storage.
+
+All logos, icons, favicons, wordmarks, visual branding, and files under internal/webui/assets/svlogo/ are proprietary branding assets and are not licensed under the Apache License. They may not be copied, modified, displayed, distributed, embedded, sublicensed, used in derivative works, used to identify another product or service, or used in any public or private deployment without prior written permission from the rights holder.
+
+Redistributors and creators of forks or derivative works must remove or replace the reserved names, logos, icons, favicons, and branding before distributing, publishing, hosting, or making the derivative work available to others, except for retaining copyright, attribution, and license notices required by the Apache License or for reasonable factual statements that identify the origin of the unmodified upstream work.
+
+The names and branding may not be used to imply sponsorship, endorsement, affiliation, certification, support, or approval by the Licensor or Crescendum. Any permitted factual reference must be limited, accurate, non-promotional, and must not be presented as part of the derivative product's own name, logo, user interface, marketing, domain, package metadata, executable name, or service identity.
+
+If there is any conflict between this addendum and the Apache License above, this addendum controls only for trademarks, names, logos, icons, visual branding, and other non-code brand assets. The software code remains subject to the Apache License unless otherwise stated in a specific file.

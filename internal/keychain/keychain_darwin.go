@@ -4,13 +4,20 @@ package keychain
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 func Get(account string) (string, error) {
-	out, err := exec.Command("security", "find-generic-password", "-s", Service, "-a", account, "-w").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "security", "find-generic-password", "-s", Service, "-a", account, "-w").Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("macOS Keychain lookup timed out; unlock the login keychain or enter the password manually")
+	}
 	if err != nil {
 		return "", fmt.Errorf("macOS Keychain lookup failed: %w", err)
 	}

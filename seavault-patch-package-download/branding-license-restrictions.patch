@@ -1,0 +1,96 @@
+diff -ruN '--exclude=.git' /tmp/licbase/seavault-fast-rclone/LICENSE /tmp/licwork/LICENSE
+--- a/LICENSE	2026-05-04 00:49:38.000000000 +0000
++++ b/LICENSE	2026-05-04 20:24:42.700384911 +0000
+@@ -53,3 +53,15 @@
+ 9. Accepting Warranty or Additional Liability. While redistributing the Work or Derivative Works thereof, You may choose to offer, and charge a fee for, acceptance of support, warranty, indemnity, or other liability obligations. However, in accepting such obligations, You may act only on Your own behalf and on Your sole responsibility, not on behalf of any other Contributor, and only if You agree to indemnify, defend, and hold each Contributor harmless for any liability incurred by, or claims asserted against, such Contributor by reason of your accepting any such warranty or additional liability.
+ 
+ END OF TERMS AND CONDITIONS
++
++BRANDING AND TRADEMARK RESERVATION ADDENDUM
++
++The Apache License above applies to the software code only, except where a file or directory states otherwise. No license is granted to use any company name, project name, product name, trade name, trademark, service mark, logo, icon, visual identity, design mark, colour system, domain name, slogan, or other branding element associated with the Licensor, Crescendum, SeaVault, SeaVault Fast, or Encrypted File Storage.
++
++All logos, icons, favicons, wordmarks, visual branding, and files under internal/webui/assets/svlogo/ are proprietary branding assets and are not licensed under the Apache License. They may not be copied, modified, displayed, distributed, embedded, sublicensed, used in derivative works, used to identify another product or service, or used in any public or private deployment without prior written permission from the rights holder.
++
++Redistributors and creators of forks or derivative works must remove or replace the reserved names, logos, icons, favicons, and branding before distributing, publishing, hosting, or making the derivative work available to others, except for retaining copyright, attribution, and license notices required by the Apache License or for reasonable factual statements that identify the origin of the unmodified upstream work.
++
++The names and branding may not be used to imply sponsorship, endorsement, affiliation, certification, support, or approval by the Licensor or Crescendum. Any permitted factual reference must be limited, accurate, non-promotional, and must not be presented as part of the derivative product's own name, logo, user interface, marketing, domain, package metadata, executable name, or service identity.
++
++If there is any conflict between this addendum and the Apache License above, this addendum controls only for trademarks, names, logos, icons, visual branding, and other non-code brand assets. The software code remains subject to the Apache License unless otherwise stated in a specific file.
+diff -ruN '--exclude=.git' /tmp/licbase/seavault-fast-rclone/README.md /tmp/licwork/README.md
+--- a/README.md	2026-05-04 00:49:38.000000000 +0000
++++ b/README.md	2026-05-04 20:24:42.701580828 +0000
+@@ -5,6 +5,17 @@
+ This repository is a working MVP, not an audited production replacement for Cryptomator.
+ 
+ 
++
++## License and branding restrictions
++
++The software code is licensed under the Apache License 2.0 unless a file states otherwise. The project name, company name, logos, icons, favicons, wordmarks, visual identity, and other branding are not licensed for reuse.
++
++Do not use the Crescendum name, SeaVault name, SeaVault Fast name, Encrypted File Storage branding, logos, icons, favicons, screenshots containing branding, or other visual branding in forks, derivative works, redistributed builds, hosted services, marketing, package metadata, executable names, product names, domains, or user interfaces without prior written permission from the rights holder.
++
++Forks and redistributed builds must remove or replace the reserved branding before publication or distribution. Limited factual references to the upstream project are allowed only where needed to preserve required notices or accurately describe origin, and must not imply sponsorship, endorsement, affiliation, certification, support, or approval.
++
++See [TRADEMARKS.md](TRADEMARKS.md) and the branding addendum in [LICENSE](LICENSE).
++
+ ## What changed in v0.14
+ 
+ - Added a protected `content/` workspace for all user files and folders. New vaults create `content/` automatically.
+diff -ruN '--exclude=.git' /tmp/licbase/seavault-fast-rclone/TRADEMARKS.md /tmp/licwork/TRADEMARKS.md
+--- a/TRADEMARKS.md	1970-01-01 00:00:00.000000000 +0000
++++ b/TRADEMARKS.md	2026-05-04 20:24:42.701998751 +0000
+@@ -0,0 +1,41 @@
++# Trademark and branding policy
++
++This repository includes software code and separate reserved branding assets.
++
++## Reserved branding
++
++The following are reserved branding elements and may not be used without prior written permission from the rights holder:
++
++- Crescendum
++- SeaVault
++- SeaVault Fast
++- Encrypted File Storage, when used as product branding for this project
++- logos, icons, favicons, wordmarks, visual identity, trade dress, colour systems, slogans, and design marks associated with the project or company
++- files under `internal/webui/assets/svlogo/`
++- screenshots, documentation images, or marketing materials that present the reserved branding as part of a product or service
++
++## What the software license permits
++
++The Apache License 2.0 applies to the software code unless a file states otherwise. It does not grant trademark, service mark, trade name, logo, icon, or branding rights.
++
++## What is not allowed
++
++Do not use reserved branding in a fork, derivative work, redistributed build, hosted service, package, executable, domain name, UI, documentation site, support channel, marketing material, screenshot, or public/private deployment in a way that suggests it is the original product or is sponsored, endorsed, affiliated, certified, supported, or approved by the rights holder.
++
++Do not copy, modify, redistribute, embed, or display the logo, icon, favicon, wordmark, or other brand assets from this repository in another product or service.
++
++## Requirements for forks and redistributed builds
++
++Before distributing, publishing, hosting, or making a fork or derivative work available to others, remove or replace all reserved branding, including:
++
++- application names and titles that use reserved names
++- logo, icon, and favicon files
++- embedded UI assets
++- documentation branding
++- package metadata
++- executable and installer names, where they use reserved branding
++- website, support, and marketing references that imply affiliation
++
++## Limited factual references
++
++You may make limited factual references to the upstream project only when needed to preserve required copyright, attribution, and license notices, or to accurately describe the origin of the unmodified upstream work. These references must be accurate, non-promotional, and must not be used as part of the derivative product's own identity.
+diff -ruN '--exclude=.git' /tmp/licbase/seavault-fast-rclone/internal/webui/assets/svlogo/README.txt /tmp/licwork/internal/webui/assets/svlogo/README.txt
+--- a/internal/webui/assets/svlogo/README.txt	2026-05-04 19:16:35.000000000 +0000
++++ b/internal/webui/assets/svlogo/README.txt	2026-05-04 20:24:42.703041340 +0000
+@@ -11,3 +11,7 @@
+ 
+ Recommended compile approach:
+ Use Go embed in internal/webui/server.go so the assets are baked into the final SeaVault binary.
++
++
++Branding restriction:
++These logo, icon, and favicon files are reserved branding assets. They are not licensed under the Apache License and may not be copied, modified, redistributed, embedded, displayed, or used in forks, derivative works, redistributed builds, hosted services, package metadata, marketing, domains, or user interfaces without prior written permission from the rights holder. Forks and redistributed builds must remove or replace these assets before publication or distribution.

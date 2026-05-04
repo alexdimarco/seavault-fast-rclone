@@ -1,0 +1,99 @@
+--- a/internal/webui/server.go	2026-05-04 21:26:39.140561473 +0000
++++ b/internal/webui/server.go	2026-05-04 21:26:15.464632066 +0000
+@@ -2525,6 +2525,10 @@
+ .vault-card .vault-name { font-weight: 700; overflow-wrap: anywhere; }
+ .vault-card .vault-path { font-size: .82rem; color: var(--muted); overflow-wrap: anywhere; }
+ .vault-card progress { height: 10px; margin-top: 8px; }
++.quick-vault-strip { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
++.quick-vault-card { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:9px 10px; border:1px solid var(--border); border-radius:999px; background:var(--panel); }
++.quick-vault-card .vault-name { font-weight:700; }
++.quick-vault-card button { padding:6px 10px; }
+ .status-open { border-color: var(--success); background: color-mix(in srgb, var(--success-bg) 60%, var(--panel-2)); }
+ .status-error, .status-missing { border-color: var(--danger); background: color-mix(in srgb, var(--danger-bg) 55%, var(--panel-2)); }
+ .status-warning { border-color: var(--button-border); background: color-mix(in srgb, var(--button) 70%, var(--panel-2)); }
+@@ -3208,17 +3212,22 @@
+   if(rows.length === 0){ box.innerHTML = '<span class="hint">No saved vaults yet.</span><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>'; return; }
+   box.innerHTML = rows.map(v => {
+     const cls = v.open ? 'status-open' : (v.status === 'missing' ? 'status-missing' : (v.status === 'error' ? 'status-error' : ''));
+-    const key = v.keychain ? 'keychain' : (v.keychainStatus === 'unavailable' ? 'no keychain' : 'password');
++    const key = v.keychain ? 'keychain' : (v.keychainStatus === 'unavailable' ? 'no keychain' : 'password required');
+     const status = v.open ? 'open' : (v.status || 'saved');
+-    return '<button class="quick-vault-button '+cls+'" title="'+esc(v.vaultPath)+'" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-keychain="'+(v.keychain?'1':'0')+'" onclick="quickOpenVault(this)"><span class="vault-name">'+esc(v.name || v.vaultPath)+'</span><span class="pill">'+esc(status)+'</span><span class="pill">'+esc(key)+'</span></button>';
+-  }).join('') + '<button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button>';
++    return '<div class="quick-vault-card '+cls+'" title="'+esc(v.vaultPath)+'">'
++      + '<span class="vault-name">'+esc(v.name || v.vaultPath)+'</span>'
++      + '<span class="pill">'+esc(status)+'</span>'
++      + '<span class="pill">'+esc(key)+'</span>'
++      + '<button type="button" class="operation" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-keychain="'+(v.keychain?'1':'0')+'" onclick="quickOpenVault(this)">Open</button>'
++      + '</div>';
++  }).join('') + '<button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>';
+ }
+ let pendingVaultOpen = null;
+ function quickOpenVault(btn){
+   const name = btn.dataset.name || '';
+   const path = btn.dataset.path || '';
+   const hasKeychain = btn.dataset.keychain === '1';
+-  if(hasKeychain){ openSavedVaultFromPassword(name, path, '', false); return; }
++  if(hasKeychain){ openSavedVaultDirect(name, path, '', false, true); return; }
+   showVaultPasswordModal(name, path);
+ }
+ function showVaultPasswordModal(name, path){
+@@ -3239,12 +3248,9 @@
+   if(!pendingVaultOpen) return;
+   const pw = $('vaultPasswordModalInput').value;
+   if(!pw){ showError('Password required', 'Enter the vault password to open this saved vault.'); return; }
+-  $('vaultPath').value = pendingVaultOpen.name || pendingVaultOpen.path;
+-  $('profile').value = pendingVaultOpen.name || '';
+-  $('password').value = pw;
+-  $('savePassword').checked = $('vaultPasswordModalSave').checked;
++  const target = pendingVaultOpen;
+   try {
+-    await openVault(false);
++    await openSavedVaultDirect(target.name, target.path, pw, $('vaultPasswordModalSave').checked, false);
+     closeVaultPasswordModal();
+   } catch(e) {
+     showError('Could not open vault', e.message || e);
+@@ -3253,19 +3259,35 @@
+ function scrollToCreateVault(){ const el=$('vault-panel'); if(el) el.scrollIntoView({behavior:'smooth', block:'start'}); }
+ function selectVaultCard(name, path){ $('vaultPath').value = path; $('profile').value = name; const sel=$('vaultSelect'); if(sel) sel.value=name; showHuman('Saved vault selected', 'Selected ' + name + '.'); }
+ async function openSavedVault(name, path, useKeychain){
+-  $('vaultPath').value = name || path;
+-  $('profile').value = name || '';
+-  await openVault(useKeychain);
++  await openSavedVaultDirect(name, path, '', false, !!useKeychain);
+ }
+ function slug(s){ return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '_'); }
++async function openSavedVaultDirect(name, path, password, saveKeychain, useKeychain){
++  const targetPath = path || name;
++  if(!targetPath){ throw new Error('Saved vault path is missing.'); }
++  const req = {vaultPath: targetPath, password: password || '', savePassword: !!saveKeychain, useKeychain: !!useKeychain};
++  const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)});
++  $('vaultPath').value = targetPath;
++  $('profile').value = name || '';
++  $('password').value = '';
++  $('savePassword').checked = false;
++  const status = await api('/api/status');
++  status.lastAction = res;
++  lastStatus = status;
++  renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status);
++  showHuman('Vault opened', status, 'success');
++  await refreshFiles(); await refreshDavFiles(); await loadProfiles();
++  return status;
++}
+ async function openSavedVaultFromPassword(name, path, passwordId, saveKeychain){
+   const pw = passwordId && $(passwordId) ? $(passwordId).value : '';
+   if(!pw && saveKeychain){ showVaultPasswordModal(name, path); $('vaultPasswordModalSave').checked = true; return; }
+-  $('vaultPath').value = name || path;
+-  $('profile').value = name || '';
+-  $('password').value = pw;
+-  $('savePassword').checked = !!saveKeychain;
+-  await openVault(!pw);
++  if(!pw){
++    try { await openSavedVaultDirect(name, path, '', false, true); return; }
++    catch(e) { showVaultPasswordModal(name, path); showError('Saved keychain password unavailable', e.message || e); return; }
++  }
++  try { await openSavedVaultDirect(name, path, pw, !!saveKeychain, false); }
++  catch(e){ showError('Could not open vault', e.message || e); }
+ }
+ function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
+ function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }

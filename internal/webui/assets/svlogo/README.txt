@@ -11,3 +11,7 @@ internal/webui/assets/
 
 Recommended compile approach:
 Use Go embed in internal/webui/server.go so the assets are baked into the final SeaVault binary.
+
+
+Branding restriction:
+These logo, icon, and favicon files are reserved branding assets. They are not licensed under the Apache License and may not be copied, modified, redistributed, embedded, displayed, or used in forks, derivative works, redistributed builds, hosted services, package metadata, marketing, domains, or user interfaces without prior written permission from the rights holder. Forks and redistributed builds must remove or replace these assets before publication or distribution.

@@ -741,24 +741,99 @@ func (v *Vault) RemovePath(virtualPath string) (int, error) {
 	return len(targets), v.SaveIndex(idx)
 }
 
+type VerifyIssue struct {
+	Path      string `json:"path,omitempty"`
+	ChunkID   string `json:"chunkId,omitempty"`
+	ChunkPath string `json:"chunkPath,omitempty"`
+	Kind      string `json:"kind"`
+	Error     string `json:"error"`
+}
+
+type VerifyReport struct {
+	OK            bool          `json:"ok"`
+	FilesChecked  int           `json:"filesChecked"`
+	ChunksChecked int           `json:"chunksChecked"`
+	BytesChecked  int64         `json:"bytesChecked"`
+	MissingChunks int           `json:"missingChunks"`
+	CorruptChunks int           `json:"corruptChunks"`
+	OtherErrors   int           `json:"otherErrors"`
+	Issues        []VerifyIssue `json:"issues,omitempty"`
+}
+
+type VerifyError struct {
+	Report VerifyReport
+}
+
+func (e *VerifyError) Error() string {
+	if e == nil {
+		return "vault verification failed"
+	}
+	return fmt.Sprintf("vault verification failed: %d issue(s), %d missing chunk(s), %d corrupt chunk(s), %d other error(s)", len(e.Report.Issues), e.Report.MissingChunks, e.Report.CorruptChunks, e.Report.OtherErrors)
+}
+
 func (v *Vault) Verify() error {
-	idx, err := v.LoadIndex()
+	report, err := v.VerifyReport()
 	if err != nil {
 		return err
 	}
+	if !report.OK {
+		return &VerifyError{Report: report}
+	}
+	return nil
+}
+
+func (v *Vault) VerifyReport() (VerifyReport, error) {
+	idx, err := v.LoadIndex()
+	if err != nil {
+		return VerifyReport{}, fmt.Errorf("load vault index: %w", err)
+	}
+	report := VerifyReport{OK: true}
 	paths := make([]string, 0, len(idx.Files))
 	for p := range idx.Files {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
+	report.FilesChecked = len(paths)
 	for _, p := range paths {
 		for _, ref := range idx.Files[p].Chunks {
+			report.ChunksChecked++
+			report.BytesChecked += int64(ref.Size)
 			if _, err := v.loadChunk(ref); err != nil {
-				return fmt.Errorf("%s: %w", p, err)
+				report.OK = false
+				issue := VerifyIssue{
+					Path:      p,
+					ChunkID:   ref.ID,
+					ChunkPath: v.chunkPath(ref.ID),
+					Kind:      classifyVerifyIssue(err),
+					Error:     err.Error(),
+				}
+				switch issue.Kind {
+				case "missing_chunk":
+					report.MissingChunks++
+				case "corrupt_chunk":
+					report.CorruptChunks++
+				default:
+					report.OtherErrors++
+				}
+				report.Issues = append(report.Issues, issue)
 			}
 		}
 	}
-	return nil
+	return report, nil
+}
+
+func classifyVerifyIssue(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return "missing_chunk"
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "decrypt") || strings.Contains(msg, "authenticate") || strings.Contains(msg, "size mismatch") || strings.Contains(msg, "object id mismatch") || strings.Contains(msg, "decode") {
+		return "corrupt_chunk"
+	}
+	return "read_error"
 }
 
 func (v *Vault) GarbageCollect() (removed int, err error) {

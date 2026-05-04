@@ -1,0 +1,70 @@
+--- a/internal/webui/server.go
++++ b/internal/webui/server.go
+@@ -2630,6 +2630,7 @@
+   <p class="hint">This is SeaVault's built-in WebDAV client. It talks to the local same-origin WebDAV endpoint and does not depend on Finder, Windows Explorer, GNOME Files, KDE Dolphin, davfs2, WinFsp, macFUSE, or FUSE.</p>
+   <p class="row-actions">
+     <button class="operation" onclick="refreshDavFiles()">Refresh folder</button>
++    <button class="secondary operation" onclick="closeVaultFromWebDAV()">Close vault</button>
+     <button class="operation" onclick="createDavFolder()">New folder</button>
+     <button class="operation" onclick="downloadSelectedDav()">Download selected file</button>
+     <button class="operation" onclick="downloadSelectedDavZip()">Download selected folder as ZIP</button>
+@@ -3378,8 +3379,10 @@
+     if(s.browserToken) updateSessionToken(s.browserToken);
+     lastStatus = s;
+     renderVaultSelector(s); renderAvailableVaults(s); renderTopVaultStrip(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
++    if(!s.open) clearWebDAVUI('Open a vault to browse files.');
+     showHuman('Status refreshed', s);
+-    Promise.allSettled([refreshFiles(), refreshDavFiles(), loadProfiles()]).then(results => {
++    const backgroundTasks = s.open ? [refreshFiles(), refreshDavFiles(), loadProfiles()] : [loadProfiles()];
++    Promise.allSettled(backgroundTasks).then(results => {
+       const failed = results.filter(r => r.status === 'rejected');
+       if(failed.length) appendLog('Background refresh warning', failed.map(f => f.reason && f.reason.message ? f.reason.message : String(f.reason)).join('\\n'));
+     });
+@@ -3391,6 +3394,7 @@
+     if(s.browserToken) updateSessionToken(s.browserToken);
+     lastStatus = s;
+     renderVaultSelector(s); renderAvailableVaults(s); renderTopVaultStrip(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
++    if(!s.open) clearWebDAVUI('Open a vault to browse files.');
+     showHuman('Saved vaults refreshed', s, 'success');
+   } catch(e){ showError('Could not refresh saved vaults', e.message); }
+ }
+@@ -3416,7 +3420,29 @@
+ }
+ async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderTopVaultStrip(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
+ async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderTopVaultStrip(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
+-async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshStatus(); } catch(e){ showError('Could not close vault', e.message); } }
++function clearWebDAVUI(message){
++  currentDavPath = 'content';
++  selectedDavPath = '';
++  selectedDavIsDir = false;
++  const tree = $('davTree');
++  const breadcrumb = $('davBreadcrumb');
++  const table = $('davTable');
++  if(tree) tree.innerHTML = '<p class="hint">Open a vault, then refresh.</p>';
++  if(breadcrumb) breadcrumb.innerHTML = '';
++  if(table) table.innerHTML = '<p class="hint">'+esc(message || 'Open a vault to browse files.')+'</p>';
++}
++async function closeVault(){
++  try {
++    const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'});
++    clearWebDAVUI('Open a vault to browse files.');
++    showHuman('Vault closed', res, 'success');
++    await refreshStatus();
++  } catch(e){ showError('Could not close vault', e.message); }
++}
++async function closeVaultFromWebDAV(){
++  await closeVault();
++}
++
+ function fileSizeTotal(files){ return Array.from(files || []).reduce((n,f)=>n+(f.size||0),0); }
+ function commonFolderRoot(files){
+   for(const f of Array.from(files || [])){
+@@ -3611,7 +3637,7 @@
+ }
+ async function refreshDavFiles(){
+   try {
+-    if(!(lastStatus && lastStatus.open)){ $('davTable').innerHTML='<p class="hint">Open a vault to browse files.</p>'; return; }
++    if(!(lastStatus && lastStatus.open)){ clearWebDAVUI('Open a vault to browse files.'); return; }
+     const rows = await davPropfind(currentDavPath);
+     renderDavBreadcrumb();
+     renderDavTable(rows.filter(x => x.path !== currentDavPath.replace(/^\/+|\/+$/g,'')));

@@ -1,0 +1,220 @@
+--- a/internal/webui/server.go	2026-05-04 21:43:08.000000000 +0000
++++ b/internal/webui/server.go	2026-05-04 22:00:17.989275138 +0000
+@@ -54,6 +54,7 @@
+ 	authSessions         map[string]time.Time
+ 	browserCloseEnabled  bool
+ 	browserSeen          bool
++	browserSessions      int
+ 	lastBrowserHeartbeat time.Time
+ 	browserCloseTimeout  time.Duration
+ 	shutdownOnce         sync.Once
+@@ -324,16 +325,17 @@
+ func (s *Server) ShutdownNotify() <-chan struct{} { return s.shutdownCh }
+ 
+ func (s *Server) watchBrowserHeartbeat() {
+-	ticker := time.NewTicker(5 * time.Second)
++	ticker := time.NewTicker(2 * time.Second)
+ 	defer ticker.Stop()
+ 	for range ticker.C {
+ 		s.mu.Lock()
+ 		enabled := s.browserCloseEnabled
+ 		seen := s.browserSeen
++		sessions := s.browserSessions
+ 		last := s.lastBrowserHeartbeat
+ 		timeout := s.browserCloseTimeout
+ 		s.mu.Unlock()
+-		if !enabled || !seen || timeout <= 0 {
++		if !enabled || !seen || timeout <= 0 || sessions > 0 {
+ 			continue
+ 		}
+ 		if time.Since(last) > timeout {
+@@ -343,6 +345,54 @@
+ 	}
+ }
+ 
++func (s *Server) handleBrowserSession(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		methodNotAllowed(w)
++		return
++	}
++	flusher, ok := w.(http.Flusher)
++	if !ok {
++		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
++		return
++	}
++	s.mu.Lock()
++	s.browserSeen = true
++	s.browserSessions++
++	s.lastBrowserHeartbeat = time.Now()
++	s.mu.Unlock()
++	defer func() {
++		s.mu.Lock()
++		if s.browserSessions > 0 {
++			s.browserSessions--
++		}
++		s.lastBrowserHeartbeat = time.Now()
++		s.mu.Unlock()
++	}()
++
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-store")
++	w.Header().Set("Connection", "keep-alive")
++	_, _ = fmt.Fprintf(w, "event: hello\ndata: ok\n\n")
++	flusher.Flush()
++
++	ticker := time.NewTicker(5 * time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-r.Context().Done():
++			return
++		case t := <-ticker.C:
++			s.mu.Lock()
++			s.lastBrowserHeartbeat = time.Now()
++			s.mu.Unlock()
++			if _, err := fmt.Fprintf(w, "event: ping\ndata: %d\n\n", t.Unix()); err != nil {
++				return
++			}
++			flusher.Flush()
++		}
++	}
++}
++
+ func (s *Server) handleBrowserHeartbeat(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+ 		methodNotAllowed(w)
+@@ -422,6 +472,10 @@
+ 		s.handleSVLogoAsset(w, r)
+ 		return
+ 	}
++	if r.URL.Path == "/api/browser-session" {
++		s.handleBrowserSession(w, r)
++		return
++	}
+ 	if r.URL.Path == "/api/browser-heartbeat" {
+ 		s.handleBrowserHeartbeat(w, r)
+ 		return
+@@ -1983,11 +2037,11 @@
+ 			if !s.keychainStatus.Available {
+ 				st.KeychainStatus = "unavailable"
+ 				st.KeychainError = s.keychainStatus.Detail
+-			} else if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
+-				st.Keychain = true
+-				st.KeychainStatus = "active"
+ 			} else {
+-				st.KeychainStatus = "not saved"
++				// Do not read the secret here. On Linux, secret-tool lookup can block
++				// behind a locked desktop keyring and hang /api/status. The UI may
++				// try keychain open on demand and fall back to the password dialog.
++				st.KeychainStatus = "available"
+ 			}
+ 		}
+ 		if st.Open {
+@@ -1998,7 +2052,7 @@
+ 				st.Referenced = stats.Referenced
+ 				st.ReferencedMB = stats.ReferencedMB
+ 			}
+-		} else if st.Keychain {
++		} else if st.KeychainStatus == "available" || st.Keychain {
+ 			st.Status = "ready"
+ 		} else {
+ 			st.Status = "password required"
+@@ -3253,34 +3307,34 @@
+   box.innerHTML = rows.map(v => {
+     const cls = v.open ? 'status-open' : (v.status === 'missing' ? 'status-missing' : (v.status === 'error' ? 'status-error' : ''));
+     const pct = v.open ? 1 : (v.exists ? 0.55 : 0.15);
+-    const key = v.keychain ? 'keychain saved' : (v.keychainStatus === 'unavailable' ? 'keychain unavailable' : 'password required');
++    const key = v.keychain ? 'keychain saved' : (v.keychainStatus === 'available' ? 'keychain available' : (v.keychainStatus === 'unavailable' ? 'keychain unavailable' : 'password required'));
+     const stats = v.open && v.files !== undefined ? '<br><small>'+Number(v.files||0)+' file(s), '+Number(v.objects||0)+' object(s), '+Number(v.referencedMB||0).toFixed(2)+' MiB referenced</small>' : '';
+     const err = v.error ? '<br><small>'+esc(v.error)+'</small>' : (v.keychainError ? '<br><small>'+esc(v.keychainError)+'</small>' : '');
+     const passwordId = 'vault-card-password-' + slug(v.name || v.vaultPath);
+-    const keyIndicator = v.keychain ? '<span class="pill">keychain active</span>' : (v.keychainStatus === 'unavailable' ? '<span class="pill">keychain unavailable</span>' : '<span class="pill">no keychain password</span>');
++    const keyIndicator = v.keychain ? '<span class="pill">keychain active</span>' : (v.keychainStatus === 'available' ? '<span class="pill">keychain available</span>' : (v.keychainStatus === 'unavailable' ? '<span class="pill">keychain unavailable</span>' : '<span class="pill">password needed</span>'));
+     const openLabel = v.keychainStatus === 'unavailable' ? 'Open with password' : 'Open';
+     return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><label>Password <input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="optional; blank uses keychain when active"></label><p class="row-actions">'+keyIndicator+'<button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">'+openLabel+'</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="verifySavedVault(this.dataset.name,this.dataset.path,this.dataset.passwordId)">Verify</button></p></article>';
+   }).join('');
+ }
+ function renderTopVaultStrip(s){
+-  const box = $('availableVaults');
++  const box = $('topSavedVaultStrip');
+   if(!box) return;
+-  const vaults = Array.isArray(s && s.profiles) ? s.profiles : [];
+-  if(!vaults.length){
++  const rows = (s && s.availableVaults) || [];
++  if(rows.length === 0){
+     box.innerHTML = '<span class="hint">No saved vaults. Use Create a vault to add one.</span><button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>';
+     return;
+   }
+-  box.innerHTML = vaults.map(v => {
+-    const status = v.open ? 'open' : (v.status || 'ready');
+-    const key = v.keychain ? 'keychain' : 'password';
+-    const cls = v.open ? 'open' : '';
+-    return '<div class="quick-vault-card '+cls+'" title="'+esc(v.vaultPath || '')+'">'
+-      + '<span class="status-dot" aria-hidden="true"></span>'
+-      + '<span class="vault-name">'+esc(v.name || v.vaultPath || 'vault')+'</span>'
++  box.innerHTML = rows.map(v => {
++    const cls = v.open ? 'top-vault-pill open' : 'top-vault-pill';
++    const canTryKeychain = !!(v.keychain || v.keychainStatus === 'active' || v.keychainStatus === 'available');
++    const key = canTryKeychain ? 'keychain' : 'password';
++    const status = v.open ? 'open' : (v.status || 'saved');
++    return '<span class="'+cls+'">'
++      + '<span class="dot"></span><strong>'+esc(v.name || v.vaultPath)+'</strong>'
+       + '<span class="pill">'+esc(status)+'</span>'
+       + '<span class="pill">'+esc(key)+'</span>'
+-      + '<button type="button" class="operation" data-name="'+esc(v.name || '')+'" data-path="'+esc(v.vaultPath || '')+'" data-keychain="'+(v.keychain?'1':'0')+'" onclick="quickOpenVault(this)">Open</button>'
+-      + '</div>';
++      + '<button type="button" class="operation" data-name="'+esc(v.name || '')+'" data-path="'+esc(v.vaultPath || '')+'" data-keychain="'+(canTryKeychain?'1':'0')+'" onclick="quickOpenVault(this)">Open</button>'
++      + '</span>';
+   }).join('') + '<button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>';
+ }
+ function scrollToCreateVault(){
+@@ -3357,7 +3411,7 @@
+ }
+ function slug(s){ return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '_'); }
+ async function openSavedVaultWithPassword(name, path, password, saveKeychain){
+-  $('vaultPath').value = name || path;
++  $('vaultPath').value = path || name;
+   $('profile').value = name || '';
+   $('password').value = password || '';
+   $('savePassword').checked = !!saveKeychain;
+@@ -3399,13 +3453,26 @@
+   } catch(e){ showError('Could not refresh saved vaults', e.message); }
+ }
+ function startBrowserHeartbeat(){
++  let eventStreamStarted = false;
++  if(window.EventSource){
++    try {
++      const es = new EventSource('/api/browser-session');
++      eventStreamStarted = true;
++      es.onopen = () => { try { appendLog('Browser session monitor connected', 'SeaVault will stop after this page closes.'); } catch(_) {} };
++      es.onerror = () => { try { appendLog('Browser session monitor warning', 'The browser session stream disconnected; heartbeat fallback remains active.', 'warning'); } catch(_) {} };
++      window.addEventListener('pagehide', () => { try { es.close(); } catch(_) {} });
++      window.addEventListener('beforeunload', () => { try { es.close(); } catch(_) {} });
++    } catch(err) {
++      try { appendLog('Browser session monitor unavailable', err && err.message ? err.message : String(err), 'warning'); } catch(_) {}
++    }
++  }
+   const beat = () => {
+     fetch('/api/browser-heartbeat', {method:'POST', keepalive:true, cache:'no-store'}).catch(err => {
+       try { appendLog('Browser heartbeat failed', err && err.message ? err.message : String(err), 'warning'); } catch (_) {}
+     });
+   };
+   beat();
+-  window.setInterval(beat, 10000);
++  window.setInterval(beat, eventStreamStarted ? 15000 : 5000);
+ }
+ async function saveCurrentVaultProfile(){
+   try {
+--- a/cmd/seavault/main.go	2026-05-04 21:34:21.000000000 +0000
++++ b/cmd/seavault/main.go	2026-05-04 22:00:17.990442992 +0000
+@@ -604,8 +604,8 @@
+ 	fmt.Printf("serving local GUI at %s\n", url)
+ 	fmt.Println("bind is local by default; do not expose this listener on an untrusted network")
+ 	if *exitOnBrowserClose {
+-		s.EnableBrowserCloseShutdown(45 * time.Second)
+-		fmt.Println("exit-on-browser-close enabled; the GUI will stop after the browser page stops sending heartbeats")
++		s.EnableBrowserCloseShutdown(10 * time.Second)
++		fmt.Println("exit-on-browser-close enabled; the GUI will stop shortly after the browser page closes")
+ 	}
+ 	if !*noOpen {
+ 		_ = openBrowser(url)

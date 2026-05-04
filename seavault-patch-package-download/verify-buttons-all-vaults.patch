@@ -1,0 +1,180 @@
+--- a/internal/webui/server.go	2026-05-04 20:51:22.653350606 +0000
++++ b/internal/webui/server.go	2026-05-04 20:52:38.284578655 +0000
+@@ -189,6 +189,13 @@
+ 	ReadOnly bool `json:"readOnly"`
+ }
+ 
++type verifyRequest struct {
++	ProfileName string `json:"profileName"`
++	VaultPath   string `json:"vaultPath"`
++	Password    string `json:"password"`
++	UseKeychain bool   `json:"useKeychain"`
++}
++
+ type vaultStatusDTO struct {
+ 	Name           string  `json:"name"`
+ 	VaultPath      string  `json:"vaultPath"`
+@@ -1105,8 +1112,13 @@
+ 		methodNotAllowed(w)
+ 		return
+ 	}
+-	v, ok := s.currentVault(w)
+-	if !ok {
++	var req verifyRequest
++	if !decodeJSON(w, r, &req) {
++		return
++	}
++	v, targetPath, err := s.vaultForVerify(req)
++	if err != nil {
++		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+ 		return
+ 	}
+ 	report, err := v.VerifyReport()
+@@ -1115,10 +1127,61 @@
+ 		return
+ 	}
+ 	if !report.OK {
+-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "vault verification failed", "report": report})
++		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "vault verification failed", "targetPath": targetPath, "report": report})
+ 		return
+ 	}
+-	writeJSON(w, http.StatusOK, report)
++	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "targetPath": targetPath, "report": report})
++}
++
++func (s *Server) vaultForVerify(req verifyRequest) (*vault.Vault, string, error) {
++	target := strings.TrimSpace(req.VaultPath)
++	if target == "" {
++		target = strings.TrimSpace(req.ProfileName)
++	}
++	if target == "" {
++		s.mu.Lock()
++		activePath := s.vaultPath
++		activeVault := s.vault
++		s.mu.Unlock()
++		if activeVault == nil {
++			return nil, "", fmt.Errorf("no vault is open")
++		}
++		return activeVault, activePath, nil
++	}
++	vaultPath, err := resolveVaultArg(target)
++	if err != nil {
++		return nil, "", err
++	}
++	s.mu.Lock()
++	activePath := s.vaultPath
++	activeVault := s.vault
++	s.mu.Unlock()
++	if activeVault != nil && samePath(vaultPath, activePath) && strings.TrimSpace(req.Password) == "" {
++		return activeVault, vaultPath, nil
++	}
++	password := req.Password
++	if strings.TrimSpace(password) == "" && req.UseKeychain {
++		cfg, err := vault.ReadConfig(vaultPath)
++		if err != nil {
++			return nil, vaultPath, err
++		}
++		if !s.keychainStatus.Available {
++			return nil, vaultPath, fmt.Errorf("%s", keychainUnavailableMessage(s.keychainStatus))
++		}
++		p, err := keychain.Get(cfg.VaultID)
++		if err != nil || strings.TrimSpace(p) == "" {
++			return nil, vaultPath, fmt.Errorf("no saved keychain password was found for this vault; enter the password on the saved vault card and verify again")
++		}
++		password = p
++	}
++	if strings.TrimSpace(password) == "" {
++		return nil, vaultPath, fmt.Errorf("password is required to verify this saved vault unless its OS keychain password is available")
++	}
++	v, err := vault.Open(vaultPath, password)
++	if err != nil {
++		return nil, vaultPath, err
++	}
++	return v, vaultPath, nil
+ }
+ 
+ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+@@ -2979,7 +3042,7 @@
+     const passwordId = 'vault-card-password-' + slug(v.name || v.vaultPath);
+     const keyIndicator = v.keychain ? '<span class="pill">keychain active</span>' : (v.keychainStatus === 'unavailable' ? '<span class="pill">keychain unavailable</span>' : '<span class="pill">no keychain password</span>');
+     const openLabel = v.keychainStatus === 'unavailable' ? 'Open with password' : 'Open';
+-    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><label>Password <input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="optional; blank uses keychain when active"></label><p class="row-actions">'+keyIndicator+'<button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">'+openLabel+'</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button></p></article>';
++    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><label>Password <input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="optional; blank uses keychain when active"></label><p class="row-actions">'+keyIndicator+'<button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">'+openLabel+'</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="verifySavedVault(this.dataset.name,this.dataset.path,this.dataset.passwordId)">Verify</button></p></article>';
+   }).join('');
+ }
+ function selectVaultCard(name, path){ $('vaultPath').value = path; $('profile').value = name; const sel=$('vaultSelect'); if(sel) sel.value=name; showHuman('Saved vault selected', 'Selected ' + name + '.'); }
+@@ -3421,10 +3484,12 @@
+ function setExportPath(p){ $('exportPath').value = p || '.'; showHuman('Export path selected', 'Selected export path: ' + (p || '.')); }
+ function downloadFile(p){ window.location = '/api/download?path=' + p; }
+ async function deleteFile(p){ try { await api('/api/file?path='+p,{method:'DELETE',headers:jsonHeaders}); showHuman('File deleted', 'Deleted selected virtual path.', 'success'); await refreshFiles(); } catch(e){ showError('Delete failed', e.message); } }
+-function formatVerifyReport(report){
+-  if(!report || typeof report !== 'object') return String(report || 'No verification report returned.');
++function formatVerifyReport(result){
++  if(!result || typeof result !== 'object') return String(result || 'No verification report returned.');
++  const report = result.report && typeof result.report === 'object' ? result.report : result;
+   const lines = [];
+   lines.push('Status: ' + (report.ok ? 'PASSED' : 'FAILED'));
++  if(result.targetPath) lines.push('Vault path: ' + result.targetPath);
+   lines.push('Files checked: ' + (report.filesChecked ?? 0));
+   lines.push('Chunks checked: ' + (report.chunksChecked ?? 0));
+   lines.push('Referenced bytes checked: ' + (report.bytesChecked ?? 0));
+@@ -3443,20 +3508,28 @@
+   }
+   return lines.join('\n');
+ }
+-async function verifyVault(){
++async function verifyVault(target){
++  target = target || {};
+   let ctl;
+   let timer;
+   const started = Date.now();
++  const label = target.name || target.vaultPath || 'open vault';
+   const statusText = () => {
+     const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000));
+-    return 'Verifying vault integrity... ' + elapsed + 's elapsed. Scanning manifests, referenced chunks, and encrypted chunk contents. Large vaults may take several minutes.';
++    return 'Verifying ' + label + '... ' + elapsed + 's elapsed. Scanning manifests, referenced chunks, and encrypted chunk contents. Large vaults may take several minutes.';
++  };
++  const req = {
++    profileName: target.name || '',
++    vaultPath: target.vaultPath || '',
++    password: target.password || '',
++    useKeychain: target.useKeychain !== false
+   };
+   try {
+     ctl = beginOperation('Vault verification started.');
+     setProgressIndeterminate(statusText());
+-    showHuman('Vault verification running', 'Scanning manifests, referenced chunks, and encrypted chunk contents. Keep this page open until verification completes.', 'info');
++    showHuman('Vault verification running', 'Scanning ' + label + '. Keep this page open until verification completes.', 'info');
+     timer = setInterval(() => setProgressIndeterminate(statusText()), 1000);
+-    const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}',signal:ctl.signal});
++    const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req),signal:ctl.signal});
+     clearInterval(timer);
+     endOperation('Vault verification complete.');
+     showHuman('Vault verification passed', formatVerifyReport(res), 'success');
+@@ -3475,12 +3548,16 @@
+     let detail = e.message;
+     try {
+       const parsed = JSON.parse(e.message);
+-      if(parsed.report) detail = formatVerifyReport(parsed.report);
++      if(parsed.report) detail = formatVerifyReport(parsed);
+       else if(parsed.error) detail = parsed.error;
+     } catch(_) {}
+     showError('Vault verification failed', detail);
+   }
+ }
++function verifySavedVault(name, path, passwordId){
++  const pw = passwordId && $(passwordId) ? $(passwordId).value : '';
++  verifyVault({name:name, vaultPath:path, password:pw, useKeychain:!pw});
++}
+ async function loadStats(){ try { const res = await api('/api/stats'); showHuman('Vault statistics', res); } catch(e){ showError('Could not load stats', e.message); } }
+ async function loadProfiles(){
+   try {
+@@ -3491,7 +3568,7 @@
+       const keychain = p.keychain ? '<span class="pill">active</span>' : (p.keychainStatus === 'unavailable' ? '<span class="pill">unavailable</span>' : '<span class="pill">not saved</span>');
+       const status = p.status ? '<br><small>'+esc(p.status)+(p.open?' | active vault':'')+'</small>' : '';
+       const err = p.error ? '<br><small>'+esc(p.error)+'</small>' : (p.keychainError ? '<br><small>'+esc(p.keychainError)+'</small>' : '');
+-      return '<tr><td>'+esc(p.name)+status+err+'</td><td class="path">'+esc(p.vaultPath)+'</td><td>'+keychain+'</td><td><input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="enter password"></td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">Open</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectMoveProfile(this.dataset.name,this.dataset.path)">Move</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>';
++      return '<tr><td>'+esc(p.name)+status+err+'</td><td class="path">'+esc(p.vaultPath)+'</td><td>'+keychain+'</td><td><input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="enter password"></td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">Open</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="verifySavedVault(this.dataset.name,this.dataset.path,this.dataset.passwordId)">Verify</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectMoveProfile(this.dataset.name,this.dataset.path)">Move</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>';
+     }).join('')+'</tbody></table>' : '<p>No saved vault locations.</p>';
+   }
+   catch(e){ $('profiles').innerHTML = '<p>'+esc(e.message)+'</p>'; }

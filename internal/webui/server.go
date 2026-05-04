@@ -44,14 +44,21 @@ import (
 )
 
 type Server struct {
-	mu             sync.Mutex
-	vaultPath      string
-	vault          *vault.Vault
-	token          string
-	webdavReadOnly bool
-	keychainStatus keychain.Status
-	config         appconfig.Config
-	authSessions   map[string]time.Time
+	mu                   sync.Mutex
+	vaultPath            string
+	vault                *vault.Vault
+	token                string
+	webdavReadOnly       bool
+	keychainStatus       keychain.Status
+	config               appconfig.Config
+	authSessions         map[string]time.Time
+	browserCloseEnabled  bool
+	browserSeen          bool
+	browserSessions      int
+	lastBrowserHeartbeat time.Time
+	browserCloseTimeout  time.Duration
+	shutdownOnce         sync.Once
+	shutdownCh           chan struct{}
 }
 
 const guiAuthAccount = "seavault-gui-http-auth"
@@ -193,6 +200,13 @@ type webdavRequest struct {
 	ReadOnly bool `json:"readOnly"`
 }
 
+type verifyRequest struct {
+	ProfileName string `json:"profileName"`
+	VaultPath   string `json:"vaultPath"`
+	Password    string `json:"password"`
+	UseKeychain bool   `json:"useKeychain"`
+}
+
 type vaultStatusDTO struct {
 	Name           string  `json:"name"`
 	VaultPath      string  `json:"vaultPath"`
@@ -286,7 +300,7 @@ func NewWithConfig(initialVault string, cfg appconfig.Config) (*Server, error) {
 		return nil, err
 	}
 	cfg = appconfig.Normalize(cfg)
-	s := &Server{token: token, keychainStatus: keychain.Check(), config: cfg, authSessions: make(map[string]time.Time)}
+	s := &Server{token: token, keychainStatus: keychain.Check(), config: cfg, authSessions: make(map[string]time.Time), shutdownCh: make(chan struct{})}
 	if strings.TrimSpace(initialVault) != "" {
 		resolved, err := resolveVaultArg(initialVault)
 		if err != nil {
@@ -295,6 +309,131 @@ func NewWithConfig(initialVault string, cfg appconfig.Config) (*Server, error) {
 		s.vaultPath = resolved
 	}
 	return s, nil
+}
+
+func (s *Server) EnableBrowserCloseShutdown(timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	s.mu.Lock()
+	s.browserCloseEnabled = true
+	s.browserCloseTimeout = timeout
+	s.lastBrowserHeartbeat = time.Now()
+	s.mu.Unlock()
+	go s.watchBrowserHeartbeat()
+}
+
+func (s *Server) ShutdownNotify() <-chan struct{} { return s.shutdownCh }
+
+func (s *Server) requestShutdownAfterBrowserGrace(grace time.Duration) {
+	if grace <= 0 {
+		grace = 8 * time.Second
+	}
+	go func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		<-timer.C
+		s.mu.Lock()
+		enabled := s.browserCloseEnabled
+		sessions := s.browserSessions
+		seen := s.browserSeen
+		last := s.lastBrowserHeartbeat
+		s.mu.Unlock()
+		if enabled && seen && sessions == 0 && time.Since(last) >= grace {
+			s.shutdownOnce.Do(func() { close(s.shutdownCh) })
+		}
+	}()
+}
+
+func (s *Server) watchBrowserHeartbeat() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.Lock()
+		enabled := s.browserCloseEnabled
+		seen := s.browserSeen
+		sessions := s.browserSessions
+		last := s.lastBrowserHeartbeat
+		timeout := s.browserCloseTimeout
+		s.mu.Unlock()
+		if !enabled || !seen || timeout <= 0 || sessions > 0 {
+			continue
+		}
+		if time.Since(last) > timeout {
+			s.shutdownOnce.Do(func() { close(s.shutdownCh) })
+			return
+		}
+	}
+}
+
+func (s *Server) handleBrowserHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+		methodNotAllowed(w)
+		return
+	}
+	s.mu.Lock()
+	s.browserSeen = true
+	s.lastBrowserHeartbeat = time.Now()
+	enabled := s.browserCloseEnabled
+	timeout := s.browserCloseTimeout
+	s.mu.Unlock()
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": enabled, "timeoutSeconds": int(timeout.Seconds())})
+}
+
+func (s *Server) handleBrowserSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if s.tokenValue() != "" && r.URL.Query().Get("token") != s.tokenValue() {
+		writeJSON(w, http.StatusForbidden, apiError{Error: "invalid browser session token"})
+		return
+	}
+	s.mu.Lock()
+	s.browserSeen = true
+	s.lastBrowserHeartbeat = time.Now()
+	s.browserSessions++
+	enabled := s.browserCloseEnabled
+	timeout := s.browserCloseTimeout
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.browserSessions > 0 {
+			s.browserSessions--
+		}
+		s.lastBrowserHeartbeat = time.Now()
+		s.mu.Unlock()
+		s.requestShutdownAfterBrowserGrace(8 * time.Second)
+	}()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, _ := w.(http.Flusher)
+	fmt.Fprintf(w, "event: open\\ndata: {\\\"enabled\\\":%t,\\\"timeoutSeconds\\\":%d}\\n\\n", enabled, int(timeout.Seconds()))
+	if flusher != nil {
+		flusher.Flush()
+	}
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			s.lastBrowserHeartbeat = time.Now()
+			s.mu.Unlock()
+			fmt.Fprint(w, ": keepalive\\n\\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
 }
 
 func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
@@ -356,6 +495,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, "/assets/svlogo/") {
 		s.handleSVLogoAsset(w, r)
+		return
+	}
+	if r.URL.Path == "/api/browser-session" {
+		s.handleBrowserSession(w, r)
+		return
+	}
+	if r.URL.Path == "/api/browser-heartbeat" {
+		s.handleBrowserHeartbeat(w, r)
 		return
 	}
 	if r.URL.Path == "/login" {
@@ -685,7 +832,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		cfgDTO = &vaultConfigDTO{Version: cfg.Version, KDF: cfg.KDF, Crypto: cfg.Crypto, Chunk: cfg.Chunk, CreatedAt: cfg.CreatedAt, ManifestMode: cfg.Crypto.ManifestMode}
 	}
 	s.mu.Unlock()
-	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths(), KeychainStatus: s.keychainStatus, AppConfig: s.currentConfig(), Dependencies: dependencies.Check(), AuthEnabled: s.guiAuthEnabled()}
+	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths(), KeychainStatus: s.keychainStatus, AppConfig: s.currentConfig(), Dependencies: dependencies.Report{Keychain: s.keychainStatus}, AuthEnabled: s.guiAuthEnabled()}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1169,15 +1316,76 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	v, ok := s.currentVault(w)
-	if !ok {
+	var req verifyRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if err := v.Verify(); err != nil {
+	v, targetPath, err := s.vaultForVerify(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+	report, err := v.VerifyReport()
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	if !report.OK {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "vault verification failed", "targetPath": targetPath, "report": report})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "targetPath": targetPath, "report": report})
+}
+
+func (s *Server) vaultForVerify(req verifyRequest) (*vault.Vault, string, error) {
+	target := strings.TrimSpace(req.VaultPath)
+	if target == "" {
+		target = strings.TrimSpace(req.ProfileName)
+	}
+	if target == "" {
+		s.mu.Lock()
+		activePath := s.vaultPath
+		activeVault := s.vault
+		s.mu.Unlock()
+		if activeVault == nil {
+			return nil, "", fmt.Errorf("no vault is open")
+		}
+		return activeVault, activePath, nil
+	}
+	vaultPath, err := resolveVaultArg(target)
+	if err != nil {
+		return nil, "", err
+	}
+	s.mu.Lock()
+	activePath := s.vaultPath
+	activeVault := s.vault
+	s.mu.Unlock()
+	if activeVault != nil && samePath(vaultPath, activePath) && strings.TrimSpace(req.Password) == "" {
+		return activeVault, vaultPath, nil
+	}
+	password := req.Password
+	if strings.TrimSpace(password) == "" && req.UseKeychain {
+		cfg, err := vault.ReadConfig(vaultPath)
+		if err != nil {
+			return nil, vaultPath, err
+		}
+		if !s.keychainStatus.Available {
+			return nil, vaultPath, fmt.Errorf("%s", keychainUnavailableMessage(s.keychainStatus))
+		}
+		p, err := keychain.Get(cfg.VaultID)
+		if err != nil || strings.TrimSpace(p) == "" {
+			return nil, vaultPath, fmt.Errorf("no saved keychain password was found for this vault; enter the password on the saved vault card and verify again")
+		}
+		password = p
+	}
+	if strings.TrimSpace(password) == "" {
+		return nil, vaultPath, fmt.Errorf("password is required to verify this saved vault unless its OS keychain password is available")
+	}
+	v, err := vault.Open(vaultPath, password)
+	if err != nil {
+		return nil, vaultPath, err
+	}
+	return v, vaultPath, nil
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -1854,11 +2062,12 @@ func (s *Server) availableVaultStatuses(entries []profile.Entry) []vaultStatusDT
 			if !s.keychainStatus.Available {
 				st.KeychainStatus = "unavailable"
 				st.KeychainError = s.keychainStatus.Detail
-			} else if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
-				st.Keychain = true
-				st.KeychainStatus = "active"
 			} else {
-				st.KeychainStatus = "not saved"
+				// Do not read secrets from the OS keychain during status refresh.
+				// Some Linux Secret Service backends can block when locked. The Open button
+				// attempts keychain access on demand and falls back to the password modal.
+				st.Keychain = true
+				st.KeychainStatus = "available"
 			}
 		}
 		if st.Open {
@@ -1869,7 +2078,7 @@ func (s *Server) availableVaultStatuses(entries []profile.Entry) []vaultStatusDT
 				st.Referenced = stats.Referenced
 				st.ReferencedMB = stats.ReferencedMB
 			}
-		} else if st.Keychain {
+		} else if st.KeychainStatus == "available" || st.Keychain {
 			st.Status = "ready"
 		} else {
 			st.Status = "password required"
@@ -2396,6 +2605,10 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 .vault-card .vault-name { font-weight: 700; overflow-wrap: anywhere; }
 .vault-card .vault-path { font-size: .82rem; color: var(--muted); overflow-wrap: anywhere; }
 .vault-card progress { height: 10px; margin-top: 8px; }
+.quick-vault-strip { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.quick-vault-card { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:9px 10px; border:1px solid var(--border); border-radius:999px; background:var(--panel); }
+.quick-vault-card .vault-name { font-weight:700; }
+.quick-vault-card button { padding:6px 10px; }
 .status-open { border-color: var(--success); background: color-mix(in srgb, var(--success-bg) 60%, var(--panel-2)); }
 .status-error, .status-missing { border-color: var(--danger); background: color-mix(in srgb, var(--danger-bg) 55%, var(--panel-2)); }
 .status-warning { border-color: var(--button-border); background: color-mix(in srgb, var(--button) 70%, var(--panel-2)); }
@@ -2420,6 +2633,23 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 .drop-zone.dragover { border-color: var(--focus); color: var(--fg); }
 .file-table tr.selected { background: color-mix(in srgb, var(--focus) 12%, transparent); }
 .file-table td:first-child { word-break: break-word; }
+ .quick-vault-panel { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: var(--panel-2); margin-bottom: 14px; }
+.quick-vault-panel header { all: unset; display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 10px; }
+.quick-vault-panel h3 { margin: 0; }
+.quick-vault-strip { display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; }
+.quick-vault-button { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 8px 10px; border-radius: 999px; border: 1px solid var(--button-border); background: var(--button); color: var(--fg); }
+.quick-vault-button .vault-label { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+.quick-vault-button .status-dot { width: 9px; height: 9px; border-radius: 999px; background: var(--muted); flex: 0 0 auto; }
+.quick-vault-button.status-open .status-dot { background: var(--success); }
+.quick-vault-button.status-missing .status-dot, .quick-vault-button.status-error .status-dot { background: var(--danger); }
+.quick-vault-button.status-closed .status-dot { background: var(--button-border); }
+.quick-vault-empty { color: var(--muted); margin: 0; }
+.modal-backdrop { position: fixed; inset: 0; display: none; place-items: center; padding: 18px; background: rgba(16,35,61,.48); z-index: 9999; }
+.modal-backdrop.open { display: grid; }
+.modal-dialog { width: min(520px, 100%); border-radius: 18px; border: 1px solid var(--border); background: var(--panel); box-shadow: 0 24px 80px rgba(0,0,0,.28); padding: 18px; }
+.modal-dialog h2 { margin-top: 0; }
+.modal-dialog .vault-path { margin: 8px 0 12px; }
+.modal-dialog label { margin-top: 12px; }
 @media (max-width: 840px) { .file-manager-grid { grid-template-columns: 1fr; } .folder-tree, .file-browser { height: min(70vh, 560px); } }
 @supports not (outline: 3px solid color-mix(in srgb, #2563eb 35%, transparent)) {
   button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus); }
@@ -2460,11 +2690,11 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
     <div class="header-actions"><a class="settings-button" href="/help">Help</a><a class="settings-button" href="#settings-panel">Settings</a>{{if .AuthEnabled}}<a class="settings-button" href="/logout">Logout</a>{{end}}</div>
   </div>
   <nav class="jump-links" aria-label="Page sections">
+    <a href="#files-panel">WebDAV files</a>
     <a href="#vault-panel">Vault</a>
     <a href="#upload-panel">Upload</a>
     <a href="#move-panel">Move vault</a>
     <a href="#export-panel">Export</a>
-    <a href="/files/">WebDAV files</a>
     <a href="#remote-panel">Remote</a>
     <a href="#settings-panel">Settings</a>
     <a href="/help">Help</a>
@@ -2475,6 +2705,45 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 </header>
 <main class="app-shell">
 <div class="content">
+<section id="files-panel">
+  <h2>WebDAV file manager</h2>
+  <p class="hint">This is SeaVault's built-in WebDAV client. It talks to the local same-origin WebDAV endpoint and does not depend on Finder, Windows Explorer, GNOME Files, KDE Dolphin, davfs2, WinFsp, macFUSE, or FUSE.</p>
+  <p class="row-actions">
+    <button class="operation" onclick="refreshDavFiles()">Refresh folder</button>
+    <button class="secondary operation" onclick="closeVaultFromWebDAV()">Close vault</button>
+    <button class="operation" onclick="createDavFolder()">New folder</button>
+    <button class="operation" onclick="downloadSelectedDav()">Download selected file</button>
+    <button class="operation" onclick="downloadSelectedDavZip()">Download selected folder as ZIP</button>
+    <button class="operation" onclick="renameSelectedDav()">Rename/move</button>
+    <button class="operation" onclick="copySelectedDav()">Copy</button>
+    <button class="danger operation" onclick="deleteSelectedDav()">Delete</button>
+    <button class="secondary" onclick="copyDavURL()">Copy WebDAV URL</button>
+    <label class="checkline"><input id="webdavReadOnly" type="checkbox" onchange="toggleWebDAVReadOnly()"> Read-only WebDAV mode</label>
+  </p>
+  <div class="form-grid">
+    <label>Upload files through WebDAV
+      <input id="davFileInput" type="file" multiple>
+      <small>Files upload into the current WebDAV folder.</small>
+    </label>
+    <label>Upload folder through WebDAV
+      <input id="davFolderInput" type="file" webkitdirectory directory multiple>
+      <small>Folder uploads preserve browser-provided relative paths.</small>
+    </label>
+  </div>
+  <div id="davDropZone" class="drop-zone">Drop files here to upload into the current folder.</div>
+  <div class="file-manager-grid">
+    <div class="folder-tree">
+      <strong>Folder tree</strong>
+      <div id="davTree"><p class="hint">Open a vault, then refresh.</p></div>
+    </div>
+    <div class="file-browser">
+      <div id="davBreadcrumb" class="breadcrumb"></div>
+      <div id="davTable" class="table-wrap"><p class="hint">Open a vault to browse files.</p></div>
+    </div>
+  </div>
+</section>
+
+
 <section id="vault-panel">
   <h2>Open or create vault</h2>
   <div class="form-grid">
@@ -2635,47 +2904,11 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   </p>
 </section>
 
-<section id="files-panel">
-  <h2>WebDAV file manager</h2>
-  <p class="hint">This is SeaVault's built-in WebDAV client. It talks to the local same-origin WebDAV endpoint and does not depend on Finder, Windows Explorer, GNOME Files, KDE Dolphin, davfs2, WinFsp, macFUSE, or FUSE.</p>
-  <p class="row-actions">
-    <button class="operation" onclick="refreshDavFiles()">Refresh folder</button>
-    <button class="operation" onclick="createDavFolder()">New folder</button>
-    <button class="operation" onclick="downloadSelectedDav()">Download selected file</button>
-    <button class="operation" onclick="downloadSelectedDavZip()">Download selected folder as ZIP</button>
-    <button class="operation" onclick="renameSelectedDav()">Rename/move</button>
-    <button class="operation" onclick="copySelectedDav()">Copy</button>
-    <button class="danger operation" onclick="deleteSelectedDav()">Delete</button>
-    <button class="secondary" onclick="copyDavURL()">Copy WebDAV URL</button>
-    <label class="checkline"><input id="webdavReadOnly" type="checkbox" onchange="toggleWebDAVReadOnly()"> Read-only WebDAV mode</label>
-  </p>
-  <div class="form-grid">
-    <label>Upload files through WebDAV
-      <input id="davFileInput" type="file" multiple>
-      <small>Files upload into the current WebDAV folder.</small>
-    </label>
-    <label>Upload folder through WebDAV
-      <input id="davFolderInput" type="file" webkitdirectory directory multiple>
-      <small>Folder uploads preserve browser-provided relative paths.</small>
-    </label>
-  </div>
-  <div id="davDropZone" class="drop-zone">Drop files here to upload into the current folder.</div>
-  <div class="file-manager-grid">
-    <div class="folder-tree">
-      <strong>Folder tree</strong>
-      <div id="davTree"><p class="hint">Open a vault, then refresh.</p></div>
-    </div>
-    <div class="file-browser">
-      <div id="davBreadcrumb" class="breadcrumb"></div>
-      <div id="davTable" class="table-wrap"><p class="hint">Open a vault to browse files.</p></div>
-    </div>
-  </div>
-</section>
 
 <section id="legacy-files-panel">
   <h2>Advanced raw file list</h2>
   <p class="hint">Debug view of virtual paths and chunk counts. Use the WebDAV file manager above for normal file browsing.</p>
-  <p class="row-actions"><button onclick="refreshFiles()">Refresh raw list</button><button onclick="verifyVault()">Verify</button><button onclick="loadStats()">Stats</button></p>
+  <p class="row-actions"><button onclick="refreshFiles()">Refresh raw list</button><button class="operation" onclick="verifyVault()">Verify</button><button onclick="loadStats()">Stats</button></p>
   <div id="files" class="table-wrap"></div>
 </section>
 
@@ -2843,11 +3076,30 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <p class="row-actions"><button class="danger" onclick="cancelActive()">Cancel active operation</button><button class="secondary" onclick="clearOutput()">Clear</button><button class="secondary" onclick="refreshStatus()">Refresh vaults</button></p>
   <h3>WebDAV</h3>
   <div id="webdavQuickBox" class="webdav-indicator"><p class="hint">WebDAV status will appear after refresh.</p></div>
-  <h3>Available saved vaults</h3>
-  <div id="availableVaults" class="vault-list">Loading saved vaults...</div>
+  <div class="header-row" style="align-items:center;margin-bottom:8px;">
+    <h3 style="margin:0;">Available saved vaults</h3>
+    <button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>
+  </div>
+  <div id="availableVaults" class="quick-vault-strip"><span class="hint">Loading saved vaults...</span></div>
   <p class="hint">Detailed logs are available on the Settings page.</p>
 </aside>
 </main>
+<div id="vaultPasswordModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="vaultPasswordTitle">
+  <div class="modal-dialog">
+    <h2 id="vaultPasswordTitle">Vault password required</h2>
+    <p class="hint">Enter the password for the selected vault. The dialog closes after the vault opens successfully.</p>
+    <div id="vaultPasswordTarget" class="vault-path"></div>
+    <label>Password
+      <input id="modalVaultPassword" type="password" autocomplete="current-password">
+    </label>
+    <label class="checkline"><input id="modalSavePassword" type="checkbox"> Save password in OS keychain</label>
+    <p class="row-actions">
+      <button class="operation" onclick="submitVaultPasswordModal()">Open vault</button>
+      <button class="secondary" onclick="closeVaultPasswordModal()">Cancel</button>
+    </p>
+  </div>
+</div>
+
 <script>
 let token = document.documentElement.dataset.token;
 let jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token};
@@ -2859,11 +3111,13 @@ let selectedDavPath = '';
 let selectedDavIsDir = false;
 let appLog = [];
 let appConfig = null;
+let pendingVaultOpen = null;
 function updateSessionToken(t){ if(t && t !== token){ token = t; document.documentElement.dataset.token = t; jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token}; } }
 function $(id){ return document.getElementById(id); }
 function setProgress(done, total, text){ const p=$('progress'); p.max=Math.max(1,total||1); p.value=Math.min(p.max,done||0); $('progressText').innerHTML='<small>'+esc(text||'')+'</small>'; }
+function setProgressIndeterminate(text){ const p=$('progress'); p.removeAttribute('value'); p.max=1; $('progressText').innerHTML='<small>'+esc(text||'')+'</small>'; }
 function setBusy(on){ document.body.classList.toggle('busy', !!on); document.querySelectorAll('button.operation').forEach(btn => { btn.disabled = !!on; }); }
-function beginOperation(text){ if(activeController){ throw new Error('Another upload/export operation is already running. Cancel it or wait for it to finish.'); } activeCancelled=false; activeController = new AbortController(); setBusy(true); setProgress(0,1,text||'Starting...'); return activeController; }
+function beginOperation(text){ if(activeController){ throw new Error('Another operation is already running. Cancel it or wait for it to finish.'); } activeCancelled=false; activeController = new AbortController(); setBusy(true); setProgress(0,1,text||'Starting...'); return activeController; }
 function endOperation(text){ activeController=null; setBusy(false); setProgress(1,1,text||'Complete.'); }
 function uploadProgressText(prefix, sentBytes, totalBytes, suffix){
   if(totalBytes > 0){
@@ -3076,34 +3330,172 @@ function renderAvailableVaults(status){
   box.innerHTML = rows.map(v => {
     const cls = v.open ? 'status-open' : (v.status === 'missing' ? 'status-missing' : (v.status === 'error' ? 'status-error' : ''));
     const pct = v.open ? 1 : (v.exists ? 0.55 : 0.15);
-    const key = v.keychain ? 'keychain saved' : (v.keychainStatus === 'unavailable' ? 'keychain unavailable' : 'password required');
+    const key = v.keychain ? 'keychain saved' : (v.keychainStatus === 'available' ? 'keychain available' : (v.keychainStatus === 'unavailable' ? 'keychain unavailable' : 'password required'));
     const stats = v.open && v.files !== undefined ? '<br><small>'+Number(v.files||0)+' file(s), '+Number(v.objects||0)+' object(s), '+Number(v.referencedMB||0).toFixed(2)+' MiB referenced</small>' : '';
     const err = v.error ? '<br><small>'+esc(v.error)+'</small>' : (v.keychainError ? '<br><small>'+esc(v.keychainError)+'</small>' : '');
     const passwordId = 'vault-card-password-' + slug(v.name || v.vaultPath);
-    const keyIndicator = v.keychain ? '<span class="pill">keychain active</span>' : (v.keychainStatus === 'unavailable' ? '<span class="pill">keychain unavailable</span>' : '<span class="pill">no keychain password</span>');
+    const keyIndicator = v.keychain ? '<span class="pill">keychain active</span>' : (v.keychainStatus === 'available' ? '<span class="pill">keychain available</span>' : (v.keychainStatus === 'unavailable' ? '<span class="pill">keychain unavailable</span>' : '<span class="pill">password needed</span>'));
     const openLabel = v.keychainStatus === 'unavailable' ? 'Open with password' : 'Open';
-    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><label>Password <input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="optional; blank uses keychain when active"></label><p class="row-actions">'+keyIndicator+'<button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">'+openLabel+'</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button></p></article>';
+    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><label>Password <input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="optional; blank uses keychain when active"></label><p class="row-actions">'+keyIndicator+'<button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">'+openLabel+'</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="verifySavedVault(this.dataset.name,this.dataset.path,this.dataset.passwordId)">Verify</button></p></article>';
   }).join('');
+}
+function renderTopVaultStrip(s){
+  const box = $('topSavedVaultStrip');
+  if(!box) return;
+  const rows = (s && s.availableVaults) || [];
+  if(rows.length === 0){
+    box.innerHTML = '<span class="hint">No saved vaults. Use Create a vault to add one.</span><button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>';
+    return;
+  }
+  box.innerHTML = rows.map(v => {
+    const cls = v.open ? 'top-vault-pill open' : 'top-vault-pill';
+    const canTryKeychain = !!(v.keychain || v.keychainStatus === 'active' || v.keychainStatus === 'available');
+    const key = canTryKeychain ? 'keychain' : 'password';
+    const status = v.open ? 'open' : (v.status || 'saved');
+    return '<span class="'+cls+'">'
+      + '<span class="dot"></span><strong>'+esc(v.name || v.vaultPath)+'</strong>'
+      + '<span class="pill">'+esc(status)+'</span>'
+      + '<span class="pill">'+esc(key)+'</span>'
+      + '<button type="button" class="operation" data-name="'+esc(v.name || '')+'" data-path="'+esc(v.vaultPath || '')+'" data-keychain="'+(canTryKeychain?'1':'0')+'" onclick="quickOpenVault(this)">Open</button>'
+      + '</span>';
+  }).join('') + '<button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>';
+}
+function scrollToCreateVault(){
+  const el = $('vault-panel');
+  if(el) el.scrollIntoView({behavior:'smooth', block:'start'});
+}
+async function quickOpenVault(btn){
+  const name = btn.dataset.name || '';
+  const path = btn.dataset.path || '';
+  const hasKeychain = btn.dataset.keychain === '1';
+  if(!path && !name){ showError('Could not open vault', 'Saved vault path is missing.'); return; }
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = 'Opening...';
+  try {
+    if(hasKeychain){
+      await openSavedVaultDirect(name, path, '', false, true);
+      return;
+    }
+    showVaultPasswordModal(name, path);
+  } catch(e) {
+    showVaultPasswordModal(name, path);
+    showError('Saved keychain password unavailable', e.message || e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText || 'Open';
+  }
+}
+function openTopVaultButton(btn){ return quickOpenVault(btn); }
+function requestVaultPassword(name, path, saveKeychain){
+  pendingVaultOpen = {name:name || '', path:path || '', saveKeychain:!!saveKeychain};
+  $('vaultPasswordTarget').textContent = (name ? name + ' | ' : '') + (path || 'saved vault');
+  $('modalVaultPassword').value = '';
+  $('modalSavePassword').checked = !!saveKeychain;
+  $('vaultPasswordModal').classList.add('open');
+  setTimeout(() => $('modalVaultPassword').focus(), 0);
+}
+function closeVaultPasswordModal(){
+  $('vaultPasswordModal').classList.remove('open');
+  $('modalVaultPassword').value = '';
+  pendingVaultOpen = null;
+}
+async function submitVaultPasswordModal(){
+  if(!pendingVaultOpen){ closeVaultPasswordModal(); return; }
+  const pw = $('modalVaultPassword').value;
+  if(!pw){ showError('Password required', 'Enter the vault password before opening this saved vault.'); return; }
+  const save = $('modalSavePassword').checked;
+  const target = pendingVaultOpen;
+  try {
+    await openSavedVaultWithPassword(target.name, target.path, pw, save);
+    closeVaultPasswordModal();
+  } catch(e){ showError('Could not open vault', e.message); }
 }
 function selectVaultCard(name, path){ $('vaultPath').value = path; $('profile').value = name; const sel=$('vaultSelect'); if(sel) sel.value=name; showHuman('Saved vault selected', 'Selected ' + name + '.'); }
 async function openSavedVault(name, path, useKeychain){
-  $('vaultPath').value = name || path;
+  await openSavedVaultDirect(name, path, '', false, !!useKeychain);
+}
+async function openSavedVaultDirect(name, path, password, saveKeychain, useKeychain){
+  const targetPath = path || name;
+  if(!targetPath){ throw new Error('Saved vault path is missing.'); }
+  const req = {vaultPath: targetPath, password: password || '', savePassword: !!saveKeychain, useKeychain: !!useKeychain};
+  const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)});
+  $('vaultPath').value = targetPath;
   $('profile').value = name || '';
-  await openVault(useKeychain);
+  $('password').value = '';
+  $('savePassword').checked = false;
+  const status = await api('/api/status');
+  status.lastAction = res;
+  lastStatus = status;
+  renderVaultSelector(status); renderAvailableVaults(status); renderTopVaultStrip(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status);
+  showHuman('Vault opened', status, 'success');
+  await refreshFiles(); await refreshDavFiles(); await loadProfiles();
+  return status;
 }
 function slug(s){ return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '_'); }
+async function openSavedVaultWithPassword(name, path, password, saveKeychain){
+  $('vaultPath').value = path || name;
+  $('profile').value = name || '';
+  $('password').value = password || '';
+  $('savePassword').checked = !!saveKeychain;
+  await openVault(!password);
+}
 async function openSavedVaultFromPassword(name, path, passwordId, saveKeychain){
   const pw = passwordId && $(passwordId) ? $(passwordId).value : '';
-  $('vaultPath').value = name || path;
-  $('profile').value = name || '';
-  $('password').value = pw;
-  $('savePassword').checked = !!saveKeychain;
-  await openVault(!pw);
+  if(!pw && saveKeychain){ showVaultPasswordModal(name, path); $('vaultPasswordModalSave').checked = true; return; }
+  if(!pw){
+    try { await openSavedVaultDirect(name, path, '', false, true); return; }
+    catch(e) { showVaultPasswordModal(name, path); showError('Saved keychain password unavailable', e.message || e); return; }
+  }
+  try { await openSavedVaultDirect(name, path, pw, !!saveKeychain, false); }
+  catch(e){ showError('Could not open vault', e.message || e); }
 }
 function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
 function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
 function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/user' || p.indexOf('/user/') === 0) return 'The path starts with /user. Use ~/Nextcloud/seavault, /Users/<name>/... on macOS, or /home/<name>/... on Linux.'; return ''; }
-async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
+async function refreshStatus(){
+  try {
+    const s = await api('/api/status');
+    if(s.browserToken) updateSessionToken(s.browserToken);
+    lastStatus = s;
+    renderVaultSelector(s); renderAvailableVaults(s); renderTopVaultStrip(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
+    if(!s.open) clearWebDAVUI('Open a vault to browse files.');
+    showHuman('Status refreshed', s);
+    const backgroundTasks = s.open ? [refreshFiles(), refreshDavFiles(), loadProfiles()] : [loadProfiles()];
+    Promise.allSettled(backgroundTasks).then(results => {
+      const failed = results.filter(r => r.status === 'rejected');
+      if(failed.length) appendLog('Background refresh warning', failed.map(f => f.reason && f.reason.message ? f.reason.message : String(f.reason)).join('\\n'));
+    });
+  } catch(e){ showError('Could not refresh status', e.message); }
+}
+async function refreshStatusFast(){
+  try {
+    const s = await api('/api/status');
+    if(s.browserToken) updateSessionToken(s.browserToken);
+    lastStatus = s;
+    renderVaultSelector(s); renderAvailableVaults(s); renderTopVaultStrip(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
+    if(!s.open) clearWebDAVUI('Open a vault to browse files.');
+    showHuman('Saved vaults refreshed', s, 'success');
+  } catch(e){ showError('Could not refresh saved vaults', e.message); }
+}
+function startBrowserHeartbeat(){
+  const beat = () => {
+    fetch('/api/browser-heartbeat', {method:'POST', keepalive:true, cache:'no-store'}).catch(err => {
+      try { appendLog('Browser heartbeat failed', err && err.message ? err.message : String(err), 'warning'); } catch (_) {}
+    });
+  };
+  const sessionToken = encodeURIComponent(token || '');
+  try {
+    const session = new EventSource('/api/browser-session?token=' + sessionToken);
+    session.onopen = () => appendLog('Browser session monitor connected', 'SeaVault will stop after this browser page closes when exit-on-browser-close is enabled.', 'success');
+    session.onerror = () => appendLog('Browser session monitor disconnected', 'SeaVault will stop shortly if no browser page reconnects.', 'warning');
+    window.addEventListener('beforeunload', () => session.close());
+  } catch(err) {
+    appendLog('Browser session monitor unavailable', err && err.message ? err.message : String(err), 'warning');
+  }
+  beat();
+  window.setInterval(beat, 10000);
+}
 async function saveCurrentVaultProfile(){
   try {
     const req = {name:$('profile').value, vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked};
@@ -3115,9 +3507,31 @@ async function saveCurrentVaultProfile(){
     await refreshStatus();
   } catch(e){ showError('Could not save vault', e.message); }
 }
-async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
-async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
-async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshStatus(); } catch(e){ showError('Could not close vault', e.message); } }
+async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderTopVaultStrip(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
+async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderTopVaultStrip(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
+function clearWebDAVUI(message){
+  currentDavPath = 'content';
+  selectedDavPath = '';
+  selectedDavIsDir = false;
+  const tree = $('davTree');
+  const breadcrumb = $('davBreadcrumb');
+  const table = $('davTable');
+  if(tree) tree.innerHTML = '<p class="hint">Open a vault, then refresh.</p>';
+  if(breadcrumb) breadcrumb.innerHTML = '';
+  if(table) table.innerHTML = '<p class="hint">'+esc(message || 'Open a vault to browse files.')+'</p>';
+}
+async function closeVault(){
+  try {
+    const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'});
+    clearWebDAVUI('Open a vault to browse files.');
+    showHuman('Vault closed', res, 'success');
+    await refreshStatus();
+  } catch(e){ showError('Could not close vault', e.message); }
+}
+async function closeVaultFromWebDAV(){
+  await closeVault();
+}
+
 function fileSizeTotal(files){ return Array.from(files || []).reduce((n,f)=>n+(f.size||0),0); }
 function commonFolderRoot(files){
   for(const f of Array.from(files || [])){
@@ -3312,7 +3726,7 @@ async function davPropfind(p){
 }
 async function refreshDavFiles(){
   try {
-    if(!(lastStatus && lastStatus.open)){ $('davTable').innerHTML='<p class="hint">Open a vault to browse files.</p>'; return; }
+    if(!(lastStatus && lastStatus.open)){ clearWebDAVUI('Open a vault to browse files.'); return; }
     const rows = await davPropfind(currentDavPath);
     renderDavBreadcrumb();
     renderDavTable(rows.filter(x => x.path !== currentDavPath.replace(/^\/+|\/+$/g,'')));
@@ -3524,7 +3938,80 @@ function dirname(p){ const i=String(p).lastIndexOf('/'); return i>0?String(p).sl
 function setExportPath(p){ $('exportPath').value = p || '.'; showHuman('Export path selected', 'Selected export path: ' + (p || '.')); }
 function downloadFile(p){ window.location = '/api/download?path=' + p; }
 async function deleteFile(p){ try { await api('/api/file?path='+p,{method:'DELETE',headers:jsonHeaders}); showHuman('File deleted', 'Deleted selected virtual path.', 'success'); await refreshFiles(); } catch(e){ showError('Delete failed', e.message); } }
-async function verifyVault(){ try { const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault verification passed', res, 'success'); } catch(e){ showError('Vault verification failed', e.message); } }
+function formatVerifyReport(result){
+  if(!result || typeof result !== 'object') return String(result || 'No verification report returned.');
+  const report = result.report && typeof result.report === 'object' ? result.report : result;
+  const lines = [];
+  lines.push('Status: ' + (report.ok ? 'PASSED' : 'FAILED'));
+  if(result.targetPath) lines.push('Vault path: ' + result.targetPath);
+  lines.push('Files checked: ' + (report.filesChecked ?? 0));
+  lines.push('Chunks checked: ' + (report.chunksChecked ?? 0));
+  lines.push('Referenced bytes checked: ' + (report.bytesChecked ?? 0));
+  const issues = Array.isArray(report.issues) ? report.issues : [];
+  if(issues.length){
+    lines.push('Issues: ' + issues.length + ' (missing chunks: ' + (report.missingChunks ?? 0) + ', corrupt chunks: ' + (report.corruptChunks ?? 0) + ', other errors: ' + (report.otherErrors ?? 0) + ')');
+    issues.slice(0, 25).forEach((issue, idx) => {
+      lines.push('');
+      lines.push('Issue ' + (idx + 1) + ': ' + (issue.kind || 'error'));
+      if(issue.path) lines.push('  file: ' + issue.path);
+      if(issue.chunkId) lines.push('  chunk: ' + issue.chunkId);
+      if(issue.chunkPath) lines.push('  chunk path: ' + issue.chunkPath);
+      if(issue.error) lines.push('  error: ' + issue.error);
+    });
+    if(issues.length > 25) lines.push('Showing first 25 issues only.');
+  }
+  return lines.join('\n');
+}
+async function verifyVault(target){
+  target = target || {};
+  let ctl;
+  let timer;
+  const started = Date.now();
+  const label = target.name || target.vaultPath || 'open vault';
+  const statusText = () => {
+    const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000));
+    return 'Verifying ' + label + '... ' + elapsed + 's elapsed. Scanning manifests, referenced chunks, and encrypted chunk contents. Large vaults may take several minutes.';
+  };
+  const req = {
+    profileName: target.name || '',
+    vaultPath: target.vaultPath || '',
+    password: target.password || '',
+    useKeychain: target.useKeychain !== false
+  };
+  try {
+    ctl = beginOperation('Vault verification started.');
+    setProgressIndeterminate(statusText());
+    showHuman('Vault verification running', 'Scanning ' + label + '. Keep this page open until verification completes.', 'info');
+    timer = setInterval(() => setProgressIndeterminate(statusText()), 1000);
+    const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req),signal:ctl.signal});
+    clearInterval(timer);
+    endOperation('Vault verification complete.');
+    showHuman('Vault verification passed', formatVerifyReport(res), 'success');
+  } catch(e){
+    if(timer) clearInterval(timer);
+    if(e && e.name === 'AbortError'){
+      activeController = null;
+      setBusy(false);
+      setProgress(0,1,'Vault verification cancelled.');
+      showError('Vault verification cancelled', 'The browser request was cancelled. If the server had already started scanning, wait briefly before starting another operation.');
+      return;
+    }
+    activeController = null;
+    setBusy(false);
+    setProgress(1,1,'Vault verification failed. See the result log for details.');
+    let detail = e.message;
+    try {
+      const parsed = JSON.parse(e.message);
+      if(parsed.report) detail = formatVerifyReport(parsed);
+      else if(parsed.error) detail = parsed.error;
+    } catch(_) {}
+    showError('Vault verification failed', detail);
+  }
+}
+function verifySavedVault(name, path, passwordId){
+  const pw = passwordId && $(passwordId) ? $(passwordId).value : '';
+  verifyVault({name:name, vaultPath:path, password:pw, useKeychain:!pw});
+}
 async function loadStats(){ try { const res = await api('/api/stats'); showHuman('Vault statistics', res); } catch(e){ showError('Could not load stats', e.message); } }
 async function loadProfiles(){
   try {
@@ -3535,7 +4022,7 @@ async function loadProfiles(){
       const keychain = p.keychain ? '<span class="pill">active</span>' : (p.keychainStatus === 'unavailable' ? '<span class="pill">unavailable</span>' : '<span class="pill">not saved</span>');
       const status = p.status ? '<br><small>'+esc(p.status)+(p.open?' | active vault':'')+'</small>' : '';
       const err = p.error ? '<br><small>'+esc(p.error)+'</small>' : (p.keychainError ? '<br><small>'+esc(p.keychainError)+'</small>' : '');
-      return '<tr><td>'+esc(p.name)+status+err+'</td><td class="path">'+esc(p.vaultPath)+'</td><td>'+keychain+'</td><td><input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="enter password"></td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">Open</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectMoveProfile(this.dataset.name,this.dataset.path)">Move</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>';
+      return '<tr><td>'+esc(p.name)+status+err+'</td><td class="path">'+esc(p.vaultPath)+'</td><td>'+keychain+'</td><td><input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="enter password"></td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">Open</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="verifySavedVault(this.dataset.name,this.dataset.path,this.dataset.passwordId)">Verify</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectMoveProfile(this.dataset.name,this.dataset.path)">Move</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>';
     }).join('')+'</tbody></table>' : '<p>No saved vault locations.</p>';
   }
   catch(e){ $('profiles').innerHTML = '<p>'+esc(e.message)+'</p>'; }
@@ -3585,7 +4072,14 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   updateUploadSelectionSummaries();
 });
+document.addEventListener('keydown', ev => {
+  const modal = $('vaultPasswordModal');
+  if(!modal || !modal.classList.contains('open')) return;
+  if(ev.key === 'Escape'){ closeVaultPasswordModal(); }
+  if(ev.key === 'Enter' && document.activeElement && document.activeElement.id === 'modalVaultPassword'){ submitVaultPasswordModal(); }
+});
 reportBrowserSupport();
+startBrowserHeartbeat();
 appendLog('SeaVault GUI started','Ready.'); refreshStatus(); loadAppConfig(); rsyncStatus(false); rcloneStatus(false); loadRemotes(); loadSSHKeys();
 </script>
 </body>

@@ -4,13 +4,20 @@ package keychain
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 func Get(account string) (string, error) {
-	out, err := exec.Command("secret-tool", "lookup", "service", Service, "vault-id", account).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "secret-tool", "lookup", "service", Service, "vault-id", account).Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("Secret Service lookup timed out; unlock the desktop keyring or enter the password manually")
+	}
 	if err != nil {
 		return "", fmt.Errorf("Secret Service lookup failed; install libsecret-tools or use SEAVAULT_PASSWORD: %w", err)
 	}

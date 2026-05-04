@@ -1,0 +1,70 @@
+--- a/cmd/seavault/main.go	2026-05-04 21:30:58.139162686 +0000
++++ b/cmd/seavault/main.go	2026-05-04 21:32:25.294787117 +0000
+@@ -561,7 +561,7 @@
+ 	fs := flag.NewFlagSet("gui", flag.ExitOnError)
+ 	addr := fs.String("addr", "127.0.0.1:8787", "local address for the browser GUI")
+ 	noOpen := fs.Bool("no-open", false, "do not open the browser automatically")
+-	exitOnBrowserClose := fs.Bool("exit-on-browser-close", false, "best-effort: stop the GUI after the browser page stops sending heartbeats")
++	exitOnBrowserClose := fs.Bool("exit-on-browser-close", true, "best-effort: stop the GUI after the browser page stops sending heartbeats; set --exit-on-browser-close=false to keep the server running")
+ 	if err := fs.Parse(args); err != nil {
+ 		return err
+ 	}
+--- a/internal/webui/server.go	2026-05-04 21:30:58.205853346 +0000
++++ b/internal/webui/server.go	2026-05-04 21:32:25.293482243 +0000
+@@ -3223,12 +3223,27 @@
+   }).join('') + '<button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>';
+ }
+ let pendingVaultOpen = null;
+-function quickOpenVault(btn){
++async function quickOpenVault(btn){
+   const name = btn.dataset.name || '';
+   const path = btn.dataset.path || '';
+   const hasKeychain = btn.dataset.keychain === '1';
+-  if(hasKeychain){ openSavedVaultDirect(name, path, '', false, true); return; }
+-  showVaultPasswordModal(name, path);
++  if(!path && !name){ showError('Could not open vault', 'Saved vault path is missing.'); return; }
++  btn.disabled = true;
++  const oldText = btn.textContent;
++  btn.textContent = 'Opening...';
++  try {
++    if(hasKeychain){
++      await openSavedVaultDirect(name, path, '', false, true);
++      return;
++    }
++    showVaultPasswordModal(name, path);
++  } catch(e) {
++    showVaultPasswordModal(name, path);
++    showError('Saved keychain password unavailable', e.message || e);
++  } finally {
++    btn.disabled = false;
++    btn.textContent = oldText || 'Open';
++  }
+ }
+ function showVaultPasswordModal(name, path){
+   pendingVaultOpen = {name:name || '', path:path || ''};
+@@ -3301,8 +3316,7 @@
+     showHuman('Status refreshed', s);
+     Promise.allSettled([refreshFiles(), refreshDavFiles(), loadProfiles()]).then(results => {
+       const failed = results.filter(r => r.status === 'rejected');
+-      if(failed.length) appendLog('Background refresh warning', failed.map(f => f.reason && f.reason.message ? f.reason.message : String(f.reason)).join('
+-'));
++      if(failed.length) appendLog('Background refresh warning', failed.map(f => f.reason && f.reason.message ? f.reason.message : String(f.reason)).join('\n'));
+     });
+   } catch(e){ showError('Could not refresh status', e.message); }
+ }
+@@ -3316,9 +3330,13 @@
+   } catch(e){ showError('Could not refresh saved vaults', e.message); }
+ }
+ function startBrowserHeartbeat(){
+-  const beat = () => { fetch('/api/browser-heartbeat', {method:'POST', keepalive:true}).catch(() => {}); };
++  const beat = () => {
++    fetch('/api/browser-heartbeat', {method:'POST', keepalive:true, cache:'no-store'}).catch(err => {
++      appendLog('Browser heartbeat failed', err && err.message ? err.message : String(err), 'warning');
++    });
++  };
+   beat();
+-  setInterval(beat, 10000);
++  window.setInterval(beat, 10000);
+ }
+ async function saveCurrentVaultProfile(){
+   try {

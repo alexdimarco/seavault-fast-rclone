@@ -1,0 +1,58 @@
+--- a/internal/webui/server.go	2026-05-04 21:17:48.367032581 +0000
++++ b/internal/webui/server.go	2026-05-04 21:18:30.394045965 +0000
+@@ -3268,7 +3268,11 @@
+     const title = (v.name || v.vaultPath || 'vault') + ' | ' + (v.status || 'saved') + (v.keychain ? ' | keychain available' : ' | password required');
+     const key = v.keychain ? 'keychain' : 'password';
+     return '<button type="button" class="quick-vault-button '+state+'" title="'+esc(title)+'" data-name="'+esc(v.name||'')+'" data-path="'+esc(v.vaultPath||'')+'" data-keychain="'+(v.keychain?'1':'0')+'" onclick="openTopVaultButton(this)"><span class="status-dot" aria-hidden="true"></span><span class="vault-label">'+esc(v.name || v.vaultPath || 'vault')+'</span><span class="pill">'+esc(v.status || 'saved')+'</span><span class="pill">'+key+'</span></button>';
+-  }).join('') + '<button type="button" class="quick-vault-button" onclick="document.getElementById('vault-panel').scrollIntoView({behavior:'smooth'});"><span class="status-dot" aria-hidden="true"></span><span class="vault-label">Create a vault</span></button>';
++  }).join('') + '<button type="button" class="quick-vault-button" onclick="scrollToCreateVault()"><span class="status-dot" aria-hidden="true"></span><span class="vault-label">Create a vault</span></button>';
++}
++function scrollToCreateVault(){
++  const el = $('vault-panel');
++  if(el) el.scrollIntoView({behavior:'smooth', block:'start'});
+ }
+ function openTopVaultButton(btn){
+   const name = btn.dataset.name || '';
+@@ -3323,7 +3327,33 @@
+ function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
+ function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
+ function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/user' || p.indexOf('/user/') === 0) return 'The path starts with /user. Use ~/Nextcloud/seavault, /Users/<name>/... on macOS, or /home/<name>/... on Linux.'; return ''; }
+-async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderTopVaultStrip(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
++async function refreshStatus(){
++  try {
++    const s = await api('/api/status');
++    if(s.browserToken) updateSessionToken(s.browserToken);
++    lastStatus = s;
++    renderVaultSelector(s); renderAvailableVaults(s); renderTopVaultStrip(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
++    showHuman('Status refreshed', s);
++    Promise.allSettled([refreshFiles(), refreshDavFiles(), loadProfiles()]).then(results => {
++      const failed = results.filter(r => r.status === 'rejected');
++      if(failed.length) appendLog('Background refresh warning', failed.map(f => f.reason && f.reason.message ? f.reason.message : String(f.reason)).join('\n'));
++    });
++  } catch(e){ showError('Could not refresh status', e.message); }
++}
++async function refreshStatusFast(){
++  try {
++    const s = await api('/api/status');
++    if(s.browserToken) updateSessionToken(s.browserToken);
++    lastStatus = s;
++    renderVaultSelector(s); renderAvailableVaults(s); renderTopVaultStrip(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
++    showHuman('Saved vaults refreshed', s, 'success');
++  } catch(e){ showError('Could not refresh saved vaults', e.message); }
++}
++function startBrowserHeartbeat(){
++  const beat = () => { fetch('/api/browser-heartbeat', {method:'POST', keepalive:true}).catch(() => {}); };
++  beat();
++  setInterval(beat, 10000);
++}
+ async function saveCurrentVaultProfile(){
+   try {
+     const req = {name:$('profile').value, vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked};
+@@ -3885,6 +3915,7 @@
+   if(ev.key === 'Enter' && document.activeElement && document.activeElement.id === 'modalVaultPassword'){ submitVaultPasswordModal(); }
+ });
+ reportBrowserSupport();
++startBrowserHeartbeat();
+ appendLog('SeaVault GUI started','Ready.'); refreshStatus(); loadAppConfig(); rsyncStatus(false); rcloneStatus(false); loadRemotes(); loadSSHKeys();
+ </script>
+ </body>

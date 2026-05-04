@@ -1,0 +1,272 @@
+--- a/cmd/seavault/main.go	2026-05-04 18:13:38.000000000 +0000
++++ b/cmd/seavault/main.go	2026-05-04 20:31:01.871971608 +0000
+@@ -362,13 +362,46 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	if err := v.Verify(); err != nil {
++	report, err := v.VerifyReport()
++	if err != nil {
+ 		return err
+ 	}
+-	fmt.Println("vault verified")
++	printVerifyReport(report)
++	if !report.OK {
++		return &vault.VerifyError{Report: report}
++	}
+ 	return nil
+ }
+ 
++func printVerifyReport(report vault.VerifyReport) {
++	status := "FAILED"
++	if report.OK {
++		status = "PASSED"
++	}
++	fmt.Printf("vault verification %s\n", status)
++	fmt.Printf("files checked: %d\n", report.FilesChecked)
++	fmt.Printf("chunks checked: %d\n", report.ChunksChecked)
++	fmt.Printf("referenced bytes checked: %d\n", report.BytesChecked)
++	if len(report.Issues) == 0 {
++		return
++	}
++	fmt.Printf("issues: %d (missing chunks: %d, corrupt chunks: %d, other errors: %d)\n", len(report.Issues), report.MissingChunks, report.CorruptChunks, report.OtherErrors)
++	for i, issue := range report.Issues {
++		fmt.Printf("\nissue %d:\n", i+1)
++		fmt.Printf("  kind: %s\n", issue.Kind)
++		if issue.Path != "" {
++			fmt.Printf("  file: %s\n", issue.Path)
++		}
++		if issue.ChunkID != "" {
++			fmt.Printf("  chunk: %s\n", issue.ChunkID)
++		}
++		if issue.ChunkPath != "" {
++			fmt.Printf("  chunk path: %s\n", issue.ChunkPath)
++		}
++		fmt.Printf("  error: %s\n", issue.Error)
++	}
++}
++
+ func cmdGC(args []string) error {
+ 	fs := flag.NewFlagSet("gc", flag.ExitOnError)
+ 	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
+--- a/internal/vault/vault.go	2026-05-04 00:49:38.000000000 +0000
++++ b/internal/vault/vault.go	2026-05-04 20:31:02.158722089 +0000
+@@ -741,24 +741,99 @@
+ 	return len(targets), v.SaveIndex(idx)
+ }
+ 
++type VerifyIssue struct {
++	Path      string `json:"path,omitempty"`
++	ChunkID   string `json:"chunkId,omitempty"`
++	ChunkPath string `json:"chunkPath,omitempty"`
++	Kind      string `json:"kind"`
++	Error     string `json:"error"`
++}
++
++type VerifyReport struct {
++	OK            bool          `json:"ok"`
++	FilesChecked  int           `json:"filesChecked"`
++	ChunksChecked int           `json:"chunksChecked"`
++	BytesChecked  int64         `json:"bytesChecked"`
++	MissingChunks int           `json:"missingChunks"`
++	CorruptChunks int           `json:"corruptChunks"`
++	OtherErrors   int           `json:"otherErrors"`
++	Issues        []VerifyIssue `json:"issues,omitempty"`
++}
++
++type VerifyError struct {
++	Report VerifyReport
++}
++
++func (e *VerifyError) Error() string {
++	if e == nil {
++		return "vault verification failed"
++	}
++	return fmt.Sprintf("vault verification failed: %d issue(s), %d missing chunk(s), %d corrupt chunk(s), %d other error(s)", len(e.Report.Issues), e.Report.MissingChunks, e.Report.CorruptChunks, e.Report.OtherErrors)
++}
++
+ func (v *Vault) Verify() error {
+-	idx, err := v.LoadIndex()
++	report, err := v.VerifyReport()
+ 	if err != nil {
+ 		return err
+ 	}
++	if !report.OK {
++		return &VerifyError{Report: report}
++	}
++	return nil
++}
++
++func (v *Vault) VerifyReport() (VerifyReport, error) {
++	idx, err := v.LoadIndex()
++	if err != nil {
++		return VerifyReport{}, fmt.Errorf("load vault index: %w", err)
++	}
++	report := VerifyReport{OK: true}
+ 	paths := make([]string, 0, len(idx.Files))
+ 	for p := range idx.Files {
+ 		paths = append(paths, p)
+ 	}
+ 	sort.Strings(paths)
++	report.FilesChecked = len(paths)
+ 	for _, p := range paths {
+ 		for _, ref := range idx.Files[p].Chunks {
++			report.ChunksChecked++
++			report.BytesChecked += int64(ref.Size)
+ 			if _, err := v.loadChunk(ref); err != nil {
+-				return fmt.Errorf("%s: %w", p, err)
++				report.OK = false
++				issue := VerifyIssue{
++					Path:      p,
++					ChunkID:   ref.ID,
++					ChunkPath: v.chunkPath(ref.ID),
++					Kind:      classifyVerifyIssue(err),
++					Error:     err.Error(),
++				}
++				switch issue.Kind {
++				case "missing_chunk":
++					report.MissingChunks++
++				case "corrupt_chunk":
++					report.CorruptChunks++
++				default:
++					report.OtherErrors++
++				}
++				report.Issues = append(report.Issues, issue)
+ 			}
+ 		}
+ 	}
+-	return nil
++	return report, nil
++}
++
++func classifyVerifyIssue(err error) string {
++	if err == nil {
++		return "ok"
++	}
++	if errors.Is(err, os.ErrNotExist) {
++		return "missing_chunk"
++	}
++	msg := strings.ToLower(err.Error())
++	if strings.Contains(msg, "decrypt") || strings.Contains(msg, "authenticate") || strings.Contains(msg, "size mismatch") || strings.Contains(msg, "object id mismatch") || strings.Contains(msg, "decode") {
++		return "corrupt_chunk"
++	}
++	return "read_error"
+ }
+ 
+ func (v *Vault) GarbageCollect() (removed int, err error) {
+--- a/internal/vault/vault_test.go	2026-05-04 00:49:38.000000000 +0000
++++ b/internal/vault/vault_test.go	2026-05-04 20:31:26.142518068 +0000
+@@ -59,6 +59,48 @@
+ 	}
+ }
+ 
++func TestVerifyReportReportsMissingChunk(t *testing.T) {
++	root := filepath.Join(t.TempDir(), "vault")
++	password := "pass"
++	createTestVault(t, root, password)
++	v, err := Open(root, password)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := v.PutReader(strings.NewReader("important content"), "content/report.txt", int64(len("important content")), 0o600, time.Now()); err != nil {
++		t.Fatal(err)
++	}
++	idx, err := v.LoadIndex()
++	if err != nil {
++		t.Fatal(err)
++	}
++	rec := idx.Files["content/report.txt"]
++	if len(rec.Chunks) == 0 {
++		t.Fatal("expected at least one chunk")
++	}
++	missing := rec.Chunks[0]
++	if err := os.Remove(v.chunkPath(missing.ID)); err != nil {
++		t.Fatal(err)
++	}
++	report, err := v.VerifyReport()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if report.OK {
++		t.Fatal("expected verification to fail")
++	}
++	if report.MissingChunks != 1 || len(report.Issues) != 1 {
++		t.Fatalf("unexpected report: %#v", report)
++	}
++	issue := report.Issues[0]
++	if issue.Kind != "missing_chunk" || issue.ChunkID != missing.ID || issue.Path != "content/report.txt" || issue.ChunkPath == "" {
++		t.Fatalf("unexpected issue: %#v", issue)
++	}
++	if err := v.Verify(); err == nil {
++		t.Fatal("expected Verify to return an error")
++	}
++}
++
+ func TestWrongPasswordFails(t *testing.T) {
+ 	root := filepath.Join(t.TempDir(), "vault")
+ 	createTestVault(t, root, "right")
+--- a/internal/webui/server.go	2026-05-04 19:09:54.000000000 +0000
++++ b/internal/webui/server.go	2026-05-04 20:31:01.875022677 +0000
+@@ -1109,11 +1109,16 @@
+ 	if !ok {
+ 		return
+ 	}
+-	if err := v.Verify(); err != nil {
++	report, err := v.VerifyReport()
++	if err != nil {
+ 		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
+ 		return
+ 	}
+-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
++	if !report.OK {
++		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "vault verification failed", "report": report})
++		return
++	}
++	writeJSON(w, http.StatusOK, report)
+ }
+ 
+ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+@@ -3415,7 +3420,42 @@
+ function setExportPath(p){ $('exportPath').value = p || '.'; showHuman('Export path selected', 'Selected export path: ' + (p || '.')); }
+ function downloadFile(p){ window.location = '/api/download?path=' + p; }
+ async function deleteFile(p){ try { await api('/api/file?path='+p,{method:'DELETE',headers:jsonHeaders}); showHuman('File deleted', 'Deleted selected virtual path.', 'success'); await refreshFiles(); } catch(e){ showError('Delete failed', e.message); } }
+-async function verifyVault(){ try { const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault verification passed', res, 'success'); } catch(e){ showError('Vault verification failed', e.message); } }
++function formatVerifyReport(report){
++  if(!report || typeof report !== 'object') return String(report || 'No verification report returned.');
++  const lines = [];
++  lines.push('Status: ' + (report.ok ? 'PASSED' : 'FAILED'));
++  lines.push('Files checked: ' + (report.filesChecked ?? 0));
++  lines.push('Chunks checked: ' + (report.chunksChecked ?? 0));
++  lines.push('Referenced bytes checked: ' + (report.bytesChecked ?? 0));
++  const issues = Array.isArray(report.issues) ? report.issues : [];
++  if(issues.length){
++    lines.push('Issues: ' + issues.length + ' (missing chunks: ' + (report.missingChunks ?? 0) + ', corrupt chunks: ' + (report.corruptChunks ?? 0) + ', other errors: ' + (report.otherErrors ?? 0) + ')');
++    issues.slice(0, 25).forEach((issue, idx) => {
++      lines.push('');
++      lines.push('Issue ' + (idx + 1) + ': ' + (issue.kind || 'error'));
++      if(issue.path) lines.push('  file: ' + issue.path);
++      if(issue.chunkId) lines.push('  chunk: ' + issue.chunkId);
++      if(issue.chunkPath) lines.push('  chunk path: ' + issue.chunkPath);
++      if(issue.error) lines.push('  error: ' + issue.error);
++    });
++    if(issues.length > 25) lines.push('Showing first 25 issues only.');
++  }
++  return lines.join('\n');
++}
++async function verifyVault(){
++  try {
++    const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}'});
++    showHuman('Vault verification passed', formatVerifyReport(res), 'success');
++  } catch(e){
++    let detail = e.message;
++    try {
++      const parsed = JSON.parse(e.message);
++      if(parsed.report) detail = formatVerifyReport(parsed.report);
++      else if(parsed.error) detail = parsed.error;
++    } catch(_) {}
++    showError('Vault verification failed', detail);
++  }
++}
+ async function loadStats(){ try { const res = await api('/api/stats'); showHuman('Vault statistics', res); } catch(e){ showError('Could not load stats', e.message); } }
+ async function loadProfiles(){
+   try {

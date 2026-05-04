@@ -1,0 +1,172 @@
+--- a/internal/webui/server.go
++++ b/internal/webui/server.go
+@@ -56,6 +56,7 @@
+ 	browserSeen          bool
+ 	lastBrowserHeartbeat time.Time
+ 	browserCloseTimeout  time.Duration
++	browserSessions      int
+ 	shutdownOnce         sync.Once
+ 	shutdownCh           chan struct{}
+ }
+@@ -317,12 +318,33 @@
+ 	s.mu.Lock()
+ 	s.browserCloseEnabled = true
+ 	s.browserCloseTimeout = timeout
++	s.lastBrowserHeartbeat = time.Now()
+ 	s.mu.Unlock()
+ 	go s.watchBrowserHeartbeat()
+ }
+ 
+ func (s *Server) ShutdownNotify() <-chan struct{} { return s.shutdownCh }
+ 
++func (s *Server) requestShutdownAfterBrowserGrace(grace time.Duration) {
++	if grace <= 0 {
++		grace = 8 * time.Second
++	}
++	go func() {
++		timer := time.NewTimer(grace)
++		defer timer.Stop()
++		<-timer.C
++		s.mu.Lock()
++		enabled := s.browserCloseEnabled
++		sessions := s.browserSessions
++		seen := s.browserSeen
++		last := s.lastBrowserHeartbeat
++		s.mu.Unlock()
++		if enabled && seen && sessions == 0 && time.Since(last) >= grace {
++			s.shutdownOnce.Do(func() { close(s.shutdownCh) })
++		}
++	}()
++}
++
+ func (s *Server) watchBrowserHeartbeat() {
+ 	ticker := time.NewTicker(5 * time.Second)
+ 	defer ticker.Stop()
+@@ -332,11 +354,12 @@
+ 		seen := s.browserSeen
+ 		last := s.lastBrowserHeartbeat
+ 		timeout := s.browserCloseTimeout
++		sessions := s.browserSessions
+ 		s.mu.Unlock()
+ 		if !enabled || !seen || timeout <= 0 {
+ 			continue
+ 		}
+-		if time.Since(last) > timeout {
++		if sessions == 0 && time.Since(last) > timeout {
+ 			s.shutdownOnce.Do(func() { close(s.shutdownCh) })
+ 			return
+ 		}
+@@ -358,7 +381,59 @@
+ 	if r.Method == http.MethodHead {
+ 		return
+ 	}
+-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "exitOnBrowserClose": enabled, "timeoutSeconds": int(timeout.Seconds())})
++	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": enabled, "timeoutSeconds": int(timeout.Seconds())})
++}
++
++func (s *Server) handleBrowserSession(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		methodNotAllowed(w)
++		return
++	}
++	if s.tokenValue() != "" && r.URL.Query().Get("token") != s.tokenValue() {
++		writeJSON(w, http.StatusForbidden, apiError{Error: "invalid browser session token"})
++		return
++	}
++	s.mu.Lock()
++	s.browserSeen = true
++	s.lastBrowserHeartbeat = time.Now()
++	s.browserSessions++
++	enabled := s.browserCloseEnabled
++	timeout := s.browserCloseTimeout
++	s.mu.Unlock()
++	defer func() {
++		s.mu.Lock()
++		if s.browserSessions > 0 {
++			s.browserSessions--
++		}
++		s.lastBrowserHeartbeat = time.Now()
++		s.mu.Unlock()
++		s.requestShutdownAfterBrowserGrace(8 * time.Second)
++	}()
++
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-store")
++	w.Header().Set("Connection", "keep-alive")
++	flusher, _ := w.(http.Flusher)
++	fmt.Fprintf(w, "event: open\\ndata: {\\\"enabled\\\":%t,\\\"timeoutSeconds\\\":%d}\\n\\n", enabled, int(timeout.Seconds()))
++	if flusher != nil {
++		flusher.Flush()
++	}
++	ticker := time.NewTicker(15 * time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-r.Context().Done():
++			return
++		case <-ticker.C:
++			s.mu.Lock()
++			s.lastBrowserHeartbeat = time.Now()
++			s.mu.Unlock()
++			fmt.Fprint(w, ": keepalive\\n\\n")
++			if flusher != nil {
++				flusher.Flush()
++			}
++		}
++	}
+ }
+ 
+ func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
+@@ -426,6 +501,10 @@
+ 		s.handleBrowserHeartbeat(w, r)
+ 		return
+ 	}
++	if r.URL.Path == "/api/browser-session" {
++		s.handleBrowserSession(w, r)
++		return
++	}
+ 	if r.URL.Path == "/login" {
+ 		if r.Method == http.MethodPost {
+ 			s.handleLogin(w, r)
+@@ -753,7 +832,7 @@
+ 		cfgDTO = &vaultConfigDTO{Version: cfg.Version, KDF: cfg.KDF, Crypto: cfg.Crypto, Chunk: cfg.Chunk, CreatedAt: cfg.CreatedAt, ManifestMode: cfg.Crypto.ManifestMode}
+ 	}
+ 	s.mu.Unlock()
+-	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths(), KeychainStatus: s.keychainStatus, AppConfig: s.currentConfig(), Dependencies: dependencies.Check(), AuthEnabled: s.guiAuthEnabled()}
++	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths(), KeychainStatus: s.keychainStatus, AppConfig: s.currentConfig(), Dependencies: dependencies.Report{Keychain: s.keychainStatus}, AuthEnabled: s.guiAuthEnabled()}
+ 	writeJSON(w, http.StatusOK, resp)
+ }
+ 
+@@ -1983,11 +2062,12 @@
+ 			if !s.keychainStatus.Available {
+ 				st.KeychainStatus = "unavailable"
+ 				st.KeychainError = s.keychainStatus.Detail
+-			} else if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
+-				st.Keychain = true
+-				st.KeychainStatus = "active"
+ 			} else {
+-				st.KeychainStatus = "not saved"
++				// Do not read secrets from the OS keychain during status refresh.
++				// Some Linux Secret Service backends can block when locked. The Open button
++				// attempts keychain access on demand and falls back to the password modal.
++				st.Keychain = true
++				st.KeychainStatus = "available"
+ 			}
+ 		}
+ 		if st.Open {
+@@ -3404,6 +3484,15 @@
+       try { appendLog('Browser heartbeat failed', err && err.message ? err.message : String(err), 'warning'); } catch (_) {}
+     });
+   };
++  const token = encodeURIComponent(browserToken || '');
++  try {
++    const session = new EventSource('/api/browser-session?token=' + token);
++    session.onopen = () => appendLog('Browser session monitor connected', 'SeaVault will stop after this browser page closes when exit-on-browser-close is enabled.', 'success');
++    session.onerror = () => appendLog('Browser session monitor disconnected', 'SeaVault will stop shortly if no browser page reconnects.', 'warning');
++    window.addEventListener('beforeunload', () => session.close());
++  } catch(err) {
++    appendLog('Browser session monitor unavailable', err && err.message ? err.message : String(err), 'warning');
++  }
+   beat();
+   window.setInterval(beat, 10000);
+ }

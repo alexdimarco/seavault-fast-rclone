@@ -1,0 +1,31 @@
+--- a/compileme.sh
++++ b/compileme.sh
+@@ -1,3 +1,6 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
+ go test ./...
+ go vet ./...
+ go build -o bin/seavault ./cmd/seavault
+--- a/scripts/gui-api-smoke-test.sh
++++ b/scripts/gui-api-smoke-test.sh
+@@ -3,6 +3,8 @@
+ 
+ BIN="${1:-seavault}"
+ WORK="$(mktemp -d)"
++export SEAVAULT_APP_HOME="$WORK/app-home"
++mkdir -p "$SEAVAULT_APP_HOME"
+ ADDR="127.0.0.1:18787"
+ URL="http://$ADDR"
+ LOG="$WORK/gui.log"
+--- a/scripts/webdav-file-manager-smoke-test.sh
++++ b/scripts/webdav-file-manager-smoke-test.sh
+@@ -3,6 +3,8 @@
+ 
+ BIN="${1:-seavault}"
+ WORK="$(mktemp -d)"
++export SEAVAULT_APP_HOME="$WORK/app-home"
++mkdir -p "$SEAVAULT_APP_HOME"
+ ADDR="127.0.0.1:18878"
+ URL="http://$ADDR"
+ LOG="$WORK/webdav.log"

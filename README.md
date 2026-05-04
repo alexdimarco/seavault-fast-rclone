@@ -5,6 +5,17 @@ SeaVault Fast is a cross-platform prototype for client-side encrypted storage. I
 This repository is a working MVP, not an audited production replacement for Cryptomator.
 
 
+
+## License and branding restrictions
+
+The software code is licensed under the Apache License 2.0 unless a file states otherwise. The project name, company name, logos, icons, favicons, wordmarks, visual identity, and other branding are not licensed for reuse.
+
+Do not use the Crescendum name, SeaVault name, SeaVault Fast name, Encrypted File Storage branding, logos, icons, favicons, screenshots containing branding, or other visual branding in forks, derivative works, redistributed builds, hosted services, marketing, package metadata, executable names, product names, domains, or user interfaces without prior written permission from the rights holder.
+
+Forks and redistributed builds must remove or replace the reserved branding before publication or distribution. Limited factual references to the upstream project are allowed only where needed to preserve required notices or accurately describe origin, and must not imply sponsorship, endorsement, affiliation, certification, support, or approval.
+
+See [TRADEMARKS.md](TRADEMARKS.md) and the branding addendum in [LICENSE](LICENSE).
+
 ## What changed in v0.14
 
 - Added a protected `content/` workspace for all user files and folders. New vaults create `content/` automatically.

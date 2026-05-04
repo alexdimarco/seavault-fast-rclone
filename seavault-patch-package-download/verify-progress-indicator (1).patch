@@ -1,0 +1,59 @@
+--- a/internal/webui/server.go	2026-05-04 20:48:31.092348289 +0000
++++ b/internal/webui/server.go	2026-05-04 20:48:14.876857932 +0000
+@@ -2571,7 +2571,7 @@
+ <section id="legacy-files-panel">
+   <h2>Advanced raw file list</h2>
+   <p class="hint">Debug view of virtual paths and chunk counts. Use the WebDAV file manager above for normal file browsing.</p>
+-  <p class="row-actions"><button onclick="refreshFiles()">Refresh raw list</button><button onclick="verifyVault()">Verify</button><button onclick="loadStats()">Stats</button></p>
++  <p class="row-actions"><button onclick="refreshFiles()">Refresh raw list</button><button class="operation" onclick="verifyVault()">Verify</button><button onclick="loadStats()">Stats</button></p>
+   <div id="files" class="table-wrap"></div>
+ </section>
+ 
+@@ -2758,8 +2758,9 @@
+ function updateSessionToken(t){ if(t && t !== token){ token = t; document.documentElement.dataset.token = t; jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token}; } }
+ function $(id){ return document.getElementById(id); }
+ function setProgress(done, total, text){ const p=$('progress'); p.max=Math.max(1,total||1); p.value=Math.min(p.max,done||0); $('progressText').innerHTML='<small>'+esc(text||'')+'</small>'; }
++function setProgressIndeterminate(text){ const p=$('progress'); p.removeAttribute('value'); p.max=1; $('progressText').innerHTML='<small>'+esc(text||'')+'</small>'; }
+ function setBusy(on){ document.body.classList.toggle('busy', !!on); document.querySelectorAll('button.operation').forEach(btn => { btn.disabled = !!on; }); }
+-function beginOperation(text){ if(activeController){ throw new Error('Another upload/export operation is already running. Cancel it or wait for it to finish.'); } activeCancelled=false; activeController = new AbortController(); setBusy(true); setProgress(0,1,text||'Starting...'); return activeController; }
++function beginOperation(text){ if(activeController){ throw new Error('Another operation is already running. Cancel it or wait for it to finish.'); } activeCancelled=false; activeController = new AbortController(); setBusy(true); setProgress(0,1,text||'Starting...'); return activeController; }
+ function endOperation(text){ activeController=null; setBusy(false); setProgress(1,1,text||'Complete.'); }
+ function uploadProgressText(prefix, sentBytes, totalBytes, suffix){
+   if(totalBytes > 0){
+@@ -3443,10 +3444,34 @@
+   return lines.join('\n');
+ }
+ async function verifyVault(){
+-  try {
+-    const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}'});
++  let ctl;
++  let timer;
++  const started = Date.now();
++  const statusText = () => {
++    const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000));
++    return 'Verifying vault integrity... ' + elapsed + 's elapsed. Scanning manifests, referenced chunks, and encrypted chunk contents. Large vaults may take several minutes.';
++  };
++  try {
++    ctl = beginOperation('Vault verification started.');
++    setProgressIndeterminate(statusText());
++    showHuman('Vault verification running', 'Scanning manifests, referenced chunks, and encrypted chunk contents. Keep this page open until verification completes.', 'info');
++    timer = setInterval(() => setProgressIndeterminate(statusText()), 1000);
++    const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}',signal:ctl.signal});
++    clearInterval(timer);
++    endOperation('Vault verification complete.');
+     showHuman('Vault verification passed', formatVerifyReport(res), 'success');
+   } catch(e){
++    if(timer) clearInterval(timer);
++    if(e && e.name === 'AbortError'){
++      activeController = null;
++      setBusy(false);
++      setProgress(0,1,'Vault verification cancelled.');
++      showError('Vault verification cancelled', 'The browser request was cancelled. If the server had already started scanning, wait briefly before starting another operation.');
++      return;
++    }
++    activeController = null;
++    setBusy(false);
++    setProgress(1,1,'Vault verification failed. See the result log for details.');
+     let detail = e.message;
+     try {
+       const parsed = JSON.parse(e.message);

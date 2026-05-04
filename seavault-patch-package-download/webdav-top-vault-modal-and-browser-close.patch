@@ -1,0 +1,342 @@
+diff -ruN sv5pm/seavault-fast-rclone/cmd/seavault/main.go sv5pm_work/cmd/seavault/main.go
+--- sv5pm/seavault-fast-rclone/cmd/seavault/main.go	2026-05-04 20:42:11.000000000 +0000
++++ sv5pm_work/cmd/seavault/main.go	2026-05-04 21:14:52.920932992 +0000
+@@ -13,6 +13,7 @@
+ 	"path/filepath"
+ 	"runtime"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/example/seavault-fast/internal/appconfig"
+ 	"github.com/example/seavault-fast/internal/importer"
+@@ -560,6 +561,7 @@
+ 	fs := flag.NewFlagSet("gui", flag.ExitOnError)
+ 	addr := fs.String("addr", "127.0.0.1:8787", "local address for the browser GUI")
+ 	noOpen := fs.Bool("no-open", false, "do not open the browser automatically")
++	exitOnBrowserClose := fs.Bool("exit-on-browser-close", false, "best-effort: stop the GUI after the browser page stops sending heartbeats")
+ 	if err := fs.Parse(args); err != nil {
+ 		return err
+ 	}
+@@ -601,13 +603,38 @@
+ 	url := scheme + "://" + *addr + "/"
+ 	fmt.Printf("serving local GUI at %s\n", url)
+ 	fmt.Println("bind is local by default; do not expose this listener on an untrusted network")
++	if *exitOnBrowserClose {
++		s.EnableBrowserCloseShutdown(45 * time.Second)
++		fmt.Println("exit-on-browser-close enabled; the GUI will stop after the browser page stops sending heartbeats")
++	}
+ 	if !*noOpen {
+ 		_ = openBrowser(url)
+ 	}
+-	if scheme == "https" {
+-		return http.ListenAndServeTLS(*addr, cfg.GUI.CertFile, cfg.GUI.KeyFile, s)
++	srv := &http.Server{Addr: *addr, Handler: s}
++	serveErr := make(chan error, 1)
++	go func() {
++		if scheme == "https" {
++			serveErr <- srv.ListenAndServeTLS(cfg.GUI.CertFile, cfg.GUI.KeyFile)
++			return
++		}
++		serveErr <- srv.ListenAndServe()
++	}()
++	select {
++	case err := <-serveErr:
++		if err == http.ErrServerClosed {
++			return nil
++		}
++		return err
++	case <-s.ShutdownNotify():
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		_ = srv.Shutdown(ctx)
++		err := <-serveErr
++		if err == http.ErrServerClosed {
++			return nil
++		}
++		return err
+ 	}
+-	return http.ListenAndServe(*addr, s)
+ }
+ 
+ func cmdMove(args []string) error {
+diff -ruN sv5pm/seavault-fast-rclone/internal/keychain/keychain_darwin.go sv5pm_work/internal/keychain/keychain_darwin.go
+--- sv5pm/seavault-fast-rclone/internal/keychain/keychain_darwin.go	2026-05-04 00:49:38.000000000 +0000
++++ sv5pm_work/internal/keychain/keychain_darwin.go	2026-05-04 21:14:21.672867742 +0000
+@@ -4,13 +4,20 @@
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"fmt"
+ 	"os/exec"
+ 	"strings"
++	"time"
+ )
+ 
+ func Get(account string) (string, error) {
+-	out, err := exec.Command("security", "find-generic-password", "-s", Service, "-a", account, "-w").Output()
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	out, err := exec.CommandContext(ctx, "security", "find-generic-password", "-s", Service, "-a", account, "-w").Output()
++	if ctx.Err() == context.DeadlineExceeded {
++		return "", fmt.Errorf("macOS Keychain lookup timed out; unlock the login keychain or enter the password manually")
++	}
+ 	if err != nil {
+ 		return "", fmt.Errorf("macOS Keychain lookup failed: %w", err)
+ 	}
+diff -ruN sv5pm/seavault-fast-rclone/internal/keychain/keychain_linux.go sv5pm_work/internal/keychain/keychain_linux.go
+--- sv5pm/seavault-fast-rclone/internal/keychain/keychain_linux.go	2026-05-04 00:49:38.000000000 +0000
++++ sv5pm_work/internal/keychain/keychain_linux.go	2026-05-04 21:14:21.671868854 +0000
+@@ -4,13 +4,20 @@
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"fmt"
+ 	"os/exec"
+ 	"strings"
++	"time"
+ )
+ 
+ func Get(account string) (string, error) {
+-	out, err := exec.Command("secret-tool", "lookup", "service", Service, "vault-id", account).Output()
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	out, err := exec.CommandContext(ctx, "secret-tool", "lookup", "service", Service, "vault-id", account).Output()
++	if ctx.Err() == context.DeadlineExceeded {
++		return "", fmt.Errorf("Secret Service lookup timed out; unlock the desktop keyring or enter the password manually")
++	}
+ 	if err != nil {
+ 		return "", fmt.Errorf("Secret Service lookup failed; install libsecret-tools or use SEAVAULT_PASSWORD: %w", err)
+ 	}
+diff -ruN sv5pm/seavault-fast-rclone/internal/webui/server.go sv5pm_work/internal/webui/server.go
+--- sv5pm/seavault-fast-rclone/internal/webui/server.go	2026-05-04 20:55:00.000000000 +0000
++++ sv5pm_work/internal/webui/server.go	2026-05-04 21:14:21.951538514 +0000
+@@ -44,14 +44,20 @@
+ )
+ 
+ type Server struct {
+-	mu             sync.Mutex
+-	vaultPath      string
+-	vault          *vault.Vault
+-	token          string
+-	webdavReadOnly bool
+-	keychainStatus keychain.Status
+-	config         appconfig.Config
+-	authSessions   map[string]time.Time
++	mu                   sync.Mutex
++	vaultPath            string
++	vault                *vault.Vault
++	token                string
++	webdavReadOnly       bool
++	keychainStatus       keychain.Status
++	config               appconfig.Config
++	authSessions         map[string]time.Time
++	browserCloseEnabled  bool
++	browserSeen          bool
++	lastBrowserHeartbeat time.Time
++	browserCloseTimeout  time.Duration
++	shutdownOnce         sync.Once
++	shutdownCh           chan struct{}
+ }
+ 
+ const guiAuthAccount = "seavault-gui-http-auth"
+@@ -293,7 +299,7 @@
+ 		return nil, err
+ 	}
+ 	cfg = appconfig.Normalize(cfg)
+-	s := &Server{token: token, keychainStatus: keychain.Check(), config: cfg, authSessions: make(map[string]time.Time)}
++	s := &Server{token: token, keychainStatus: keychain.Check(), config: cfg, authSessions: make(map[string]time.Time), shutdownCh: make(chan struct{})}
+ 	if strings.TrimSpace(initialVault) != "" {
+ 		resolved, err := resolveVaultArg(initialVault)
+ 		if err != nil {
+@@ -304,6 +310,57 @@
+ 	return s, nil
+ }
+ 
++func (s *Server) EnableBrowserCloseShutdown(timeout time.Duration) {
++	if timeout <= 0 {
++		timeout = 45 * time.Second
++	}
++	s.mu.Lock()
++	s.browserCloseEnabled = true
++	s.browserCloseTimeout = timeout
++	s.mu.Unlock()
++	go s.watchBrowserHeartbeat()
++}
++
++func (s *Server) ShutdownNotify() <-chan struct{} { return s.shutdownCh }
++
++func (s *Server) watchBrowserHeartbeat() {
++	ticker := time.NewTicker(5 * time.Second)
++	defer ticker.Stop()
++	for range ticker.C {
++		s.mu.Lock()
++		enabled := s.browserCloseEnabled
++		seen := s.browserSeen
++		last := s.lastBrowserHeartbeat
++		timeout := s.browserCloseTimeout
++		s.mu.Unlock()
++		if !enabled || !seen || timeout <= 0 {
++			continue
++		}
++		if time.Since(last) > timeout {
++			s.shutdownOnce.Do(func() { close(s.shutdownCh) })
++			return
++		}
++	}
++}
++
++func (s *Server) handleBrowserHeartbeat(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
++		methodNotAllowed(w)
++		return
++	}
++	s.mu.Lock()
++	s.browserSeen = true
++	s.lastBrowserHeartbeat = time.Now()
++	enabled := s.browserCloseEnabled
++	timeout := s.browserCloseTimeout
++	s.mu.Unlock()
++	w.Header().Set("Cache-Control", "no-store")
++	if r.Method == http.MethodHead {
++		return
++	}
++	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "exitOnBrowserClose": enabled, "timeoutSeconds": int(timeout.Seconds())})
++}
++
+ func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+@@ -365,6 +422,10 @@
+ 		s.handleSVLogoAsset(w, r)
+ 		return
+ 	}
++	if r.URL.Path == "/api/browser-heartbeat" {
++		s.handleBrowserHeartbeat(w, r)
++		return
++	}
+ 	if r.URL.Path == "/login" {
+ 		if r.Method == http.MethodPost {
+ 			s.handleLogin(w, r)
+@@ -2911,8 +2972,11 @@
+   <p class="row-actions"><button class="danger" onclick="cancelActive()">Cancel active operation</button><button class="secondary" onclick="clearOutput()">Clear</button><button class="secondary" onclick="refreshStatus()">Refresh vaults</button></p>
+   <h3>WebDAV</h3>
+   <div id="webdavQuickBox" class="webdav-indicator"><p class="hint">WebDAV status will appear after refresh.</p></div>
+-  <h3>Available saved vaults</h3>
+-  <div id="availableVaults" class="vault-list">Loading saved vaults...</div>
++  <div class="header-row" style="align-items:center;margin-bottom:8px;">
++    <h3 style="margin:0;">Available saved vaults</h3>
++    <button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>
++  </div>
++  <div id="availableVaults" class="quick-vault-strip"><span class="hint">Loading saved vaults...</span></div>
+   <p class="hint">Detailed logs are available on the Settings page.</p>
+ </aside>
+ </main>
+@@ -3141,19 +3205,52 @@
+   const box = $('availableVaults');
+   if(!box) return;
+   const rows = status.availableVaults || [];
+-  if(rows.length === 0){ box.innerHTML = '<p class="hint">No saved vaults yet. Create or open a vault, enter a saved vault name, select Save password in OS keychain if desired, then click Save vault location/password.</p>'; return; }
++  if(rows.length === 0){ box.innerHTML = '<span class="hint">No saved vaults yet.</span><button class="secondary" onclick="scrollToCreateVault()">Create a vault</button>'; return; }
+   box.innerHTML = rows.map(v => {
+     const cls = v.open ? 'status-open' : (v.status === 'missing' ? 'status-missing' : (v.status === 'error' ? 'status-error' : ''));
+-    const pct = v.open ? 1 : (v.exists ? 0.55 : 0.15);
+-    const key = v.keychain ? 'keychain saved' : (v.keychainStatus === 'unavailable' ? 'keychain unavailable' : 'password required');
+-    const stats = v.open && v.files !== undefined ? '<br><small>'+Number(v.files||0)+' file(s), '+Number(v.objects||0)+' object(s), '+Number(v.referencedMB||0).toFixed(2)+' MiB referenced</small>' : '';
+-    const err = v.error ? '<br><small>'+esc(v.error)+'</small>' : (v.keychainError ? '<br><small>'+esc(v.keychainError)+'</small>' : '');
+-    const passwordId = 'vault-card-password-' + slug(v.name || v.vaultPath);
+-    const keyIndicator = v.keychain ? '<span class="pill">keychain active</span>' : (v.keychainStatus === 'unavailable' ? '<span class="pill">keychain unavailable</span>' : '<span class="pill">no keychain password</span>');
+-    const openLabel = v.keychainStatus === 'unavailable' ? 'Open with password' : 'Open';
+-    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><label>Password <input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="optional; blank uses keychain when active"></label><p class="row-actions">'+keyIndicator+'<button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">'+openLabel+'</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="verifySavedVault(this.dataset.name,this.dataset.path,this.dataset.passwordId)">Verify</button></p></article>';
+-  }).join('');
++    const key = v.keychain ? 'keychain' : (v.keychainStatus === 'unavailable' ? 'no keychain' : 'password');
++    const status = v.open ? 'open' : (v.status || 'saved');
++    return '<button class="quick-vault-button '+cls+'" title="'+esc(v.vaultPath)+'" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-keychain="'+(v.keychain?'1':'0')+'" onclick="quickOpenVault(this)"><span class="vault-name">'+esc(v.name || v.vaultPath)+'</span><span class="pill">'+esc(status)+'</span><span class="pill">'+esc(key)+'</span></button>';
++  }).join('') + '<button class="secondary" onclick="refreshStatusFast()">Refresh vaults</button>';
++}
++let pendingVaultOpen = null;
++function quickOpenVault(btn){
++  const name = btn.dataset.name || '';
++  const path = btn.dataset.path || '';
++  const hasKeychain = btn.dataset.keychain === '1';
++  if(hasKeychain){ openSavedVaultFromPassword(name, path, '', false); return; }
++  showVaultPasswordModal(name, path);
++}
++function showVaultPasswordModal(name, path){
++  pendingVaultOpen = {name:name || '', path:path || ''};
++  $('vaultPasswordPrompt').textContent = 'Enter the password for ' + (name || path) + '.';
++  $('vaultPasswordPath').textContent = path || '';
++  $('vaultPasswordModalInput').value = '';
++  $('vaultPasswordModalSave').checked = false;
++  $('vaultPasswordModal').classList.add('open');
++  setTimeout(() => $('vaultPasswordModalInput').focus(), 0);
++}
++function closeVaultPasswordModal(){
++  $('vaultPasswordModal').classList.remove('open');
++  $('vaultPasswordModalInput').value = '';
++  pendingVaultOpen = null;
++}
++async function submitVaultPasswordModal(){
++  if(!pendingVaultOpen) return;
++  const pw = $('vaultPasswordModalInput').value;
++  if(!pw){ showError('Password required', 'Enter the vault password to open this saved vault.'); return; }
++  $('vaultPath').value = pendingVaultOpen.name || pendingVaultOpen.path;
++  $('profile').value = pendingVaultOpen.name || '';
++  $('password').value = pw;
++  $('savePassword').checked = $('vaultPasswordModalSave').checked;
++  try {
++    await openVault(false);
++    closeVaultPasswordModal();
++  } catch(e) {
++    showError('Could not open vault', e.message || e);
++  }
+ }
++function scrollToCreateVault(){ const el=$('vault-panel'); if(el) el.scrollIntoView({behavior:'smooth', block:'start'}); }
+ function selectVaultCard(name, path){ $('vaultPath').value = path; $('profile').value = name; const sel=$('vaultSelect'); if(sel) sel.value=name; showHuman('Saved vault selected', 'Selected ' + name + '.'); }
+ async function openSavedVault(name, path, useKeychain){
+   $('vaultPath').value = name || path;
+@@ -3163,6 +3260,7 @@
+ function slug(s){ return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '_'); }
+ async function openSavedVaultFromPassword(name, path, passwordId, saveKeychain){
+   const pw = passwordId && $(passwordId) ? $(passwordId).value : '';
++  if(!pw && saveKeychain){ showVaultPasswordModal(name, path); $('vaultPasswordModalSave').checked = true; return; }
+   $('vaultPath').value = name || path;
+   $('profile').value = name || '';
+   $('password').value = pw;
+@@ -3172,7 +3270,34 @@
+ function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
+ function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
+ function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/user' || p.indexOf('/user/') === 0) return 'The path starts with /user. Use ~/Nextcloud/seavault, /Users/<name>/... on macOS, or /home/<name>/... on Linux.'; return ''; }
+-async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
++async function refreshStatus(){
++  try {
++    const s = await api('/api/status');
++    if(s.browserToken) updateSessionToken(s.browserToken);
++    lastStatus = s;
++    renderVaultSelector(s); renderAvailableVaults(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
++    showHuman('Status refreshed', s);
++    Promise.allSettled([refreshFiles(), refreshDavFiles(), loadProfiles()]).then(results => {
++      const failed = results.filter(r => r.status === 'rejected');
++      if(failed.length) appendLog('Background refresh warning', failed.map(f => f.reason && f.reason.message ? f.reason.message : String(f.reason)).join('
++'));
++    });
++  } catch(e){ showError('Could not refresh status', e.message); }
++}
++async function refreshStatusFast(){
++  try {
++    const s = await api('/api/status');
++    if(s.browserToken) updateSessionToken(s.browserToken);
++    lastStatus = s;
++    renderVaultSelector(s); renderAvailableVaults(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s);
++    showHuman('Saved vaults refreshed', s, 'success');
++  } catch(e){ showError('Could not refresh saved vaults', e.message); }
++}
++function startBrowserHeartbeat(){
++  const beat = () => { fetch('/api/browser-heartbeat', {method:'POST', keepalive:true}).catch(() => {}); };
++  beat();
++  setInterval(beat, 10000);
++}
+ async function saveCurrentVaultProfile(){
+   try {
+     const req = {name:$('profile').value, vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked};

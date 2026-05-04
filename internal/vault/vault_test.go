@@ -59,6 +59,48 @@ func TestRoundTripFile(t *testing.T) {
 	}
 }
 
+func TestVerifyReportReportsMissingChunk(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	password := "pass"
+	createTestVault(t, root, password)
+	v, err := Open(root, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.PutReader(strings.NewReader("important content"), "content/report.txt", int64(len("important content")), 0o600, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := v.LoadIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := idx.Files["content/report.txt"]
+	if len(rec.Chunks) == 0 {
+		t.Fatal("expected at least one chunk")
+	}
+	missing := rec.Chunks[0]
+	if err := os.Remove(v.chunkPath(missing.ID)); err != nil {
+		t.Fatal(err)
+	}
+	report, err := v.VerifyReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.OK {
+		t.Fatal("expected verification to fail")
+	}
+	if report.MissingChunks != 1 || len(report.Issues) != 1 {
+		t.Fatalf("unexpected report: %#v", report)
+	}
+	issue := report.Issues[0]
+	if issue.Kind != "missing_chunk" || issue.ChunkID != missing.ID || issue.Path != "content/report.txt" || issue.ChunkPath == "" {
+		t.Fatalf("unexpected issue: %#v", issue)
+	}
+	if err := v.Verify(); err == nil {
+		t.Fatal("expected Verify to return an error")
+	}
+}
+
 func TestWrongPasswordFails(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "vault")
 	createTestVault(t, root, "right")

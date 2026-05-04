@@ -1,0 +1,13 @@
+--- a/internal/webui/server.go
++++ b/internal/webui/server.go
+@@ -2628,10 +2628,6 @@
+ <section id="files-panel">
+   <h2>WebDAV file manager</h2>
+   <p class="hint">This is SeaVault's built-in WebDAV client. It talks to the local same-origin WebDAV endpoint and does not depend on Finder, Windows Explorer, GNOME Files, KDE Dolphin, davfs2, WinFsp, macFUSE, or FUSE.</p>
+-  <div class="quick-vault-panel" aria-label="Open saved vaults">
+-    <header><h3>Available saved vaults</h3><button class="secondary" onclick="refreshStatus()">Refresh vaults</button></header>
+-    <div id="topVaultStrip" class="quick-vault-strip"><p class="quick-vault-empty">Loading saved vaults...</p></div>
+-  </div>
+   <p class="row-actions">
+     <button class="operation" onclick="refreshDavFiles()">Refresh folder</button>
+     <button class="operation" onclick="createDavFolder()">New folder</button>

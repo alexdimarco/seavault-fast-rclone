@@ -1,0 +1,121 @@
+--- a/internal/webui/server.go	2026-05-04 22:24:45.915932799 +0000
++++ b/internal/webui/server.go	2026-05-04 22:24:19.894830891 +0000
+@@ -57,7 +57,6 @@
+ 	browserSessions      int
+ 	lastBrowserHeartbeat time.Time
+ 	browserCloseTimeout  time.Duration
+-	browserSessions      int
+ 	shutdownOnce         sync.Once
+ 	shutdownCh           chan struct{}
+ }
+@@ -314,7 +313,7 @@
+ 
+ func (s *Server) EnableBrowserCloseShutdown(timeout time.Duration) {
+ 	if timeout <= 0 {
+-		timeout = 45 * time.Second
++		timeout = 10 * time.Second
+ 	}
+ 	s.mu.Lock()
+ 	s.browserCloseEnabled = true
+@@ -347,74 +346,26 @@
+ }
+ 
+ func (s *Server) watchBrowserHeartbeat() {
+-	ticker := time.NewTicker(5 * time.Second)
++	ticker := time.NewTicker(2 * time.Second)
+ 	defer ticker.Stop()
+ 	for range ticker.C {
+ 		s.mu.Lock()
+ 		enabled := s.browserCloseEnabled
+ 		seen := s.browserSeen
++		sessions := s.browserSessions
+ 		last := s.lastBrowserHeartbeat
+ 		timeout := s.browserCloseTimeout
+-		sessions := s.browserSessions
+ 		s.mu.Unlock()
+-		if !enabled || !seen || timeout <= 0 {
++		if !enabled || !seen || timeout <= 0 || sessions > 0 {
+ 			continue
+ 		}
+-		if sessions == 0 && time.Since(last) > timeout {
++		if time.Since(last) > timeout {
+ 			s.shutdownOnce.Do(func() { close(s.shutdownCh) })
+ 			return
+ 		}
+ 	}
+ }
+ 
+-func (s *Server) handleBrowserSession(w http.ResponseWriter, r *http.Request) {
+-	if r.Method != http.MethodGet {
+-		methodNotAllowed(w)
+-		return
+-	}
+-	flusher, ok := w.(http.Flusher)
+-	if !ok {
+-		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
+-		return
+-	}
+-	s.mu.Lock()
+-	s.browserSeen = true
+-	s.browserSessions++
+-	s.lastBrowserHeartbeat = time.Now()
+-	s.mu.Unlock()
+-	defer func() {
+-		s.mu.Lock()
+-		if s.browserSessions > 0 {
+-			s.browserSessions--
+-		}
+-		s.lastBrowserHeartbeat = time.Now()
+-		s.mu.Unlock()
+-	}()
+-
+-	w.Header().Set("Content-Type", "text/event-stream")
+-	w.Header().Set("Cache-Control", "no-store")
+-	w.Header().Set("Connection", "keep-alive")
+-	_, _ = fmt.Fprintf(w, "event: hello\ndata: ok\n\n")
+-	flusher.Flush()
+-
+-	ticker := time.NewTicker(5 * time.Second)
+-	defer ticker.Stop()
+-	for {
+-		select {
+-		case <-r.Context().Done():
+-			return
+-		case t := <-ticker.C:
+-			s.mu.Lock()
+-			s.lastBrowserHeartbeat = time.Now()
+-			s.mu.Unlock()
+-			if _, err := fmt.Fprintf(w, "event: ping\ndata: %d\n\n", t.Unix()); err != nil {
+-				return
+-			}
+-			flusher.Flush()
+-		}
+-	}
+-}
+-
+ func (s *Server) handleBrowserHeartbeat(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
+ 		methodNotAllowed(w)
+@@ -554,10 +505,6 @@
+ 		s.handleBrowserHeartbeat(w, r)
+ 		return
+ 	}
+-	if r.URL.Path == "/api/browser-session" {
+-		s.handleBrowserSession(w, r)
+-		return
+-	}
+ 	if r.URL.Path == "/login" {
+ 		if r.Method == http.MethodPost {
+ 			s.handleLogin(w, r)
+@@ -3537,9 +3484,9 @@
+       try { appendLog('Browser heartbeat failed', err && err.message ? err.message : String(err), 'warning'); } catch (_) {}
+     });
+   };
+-  const token = encodeURIComponent(browserToken || '');
++  const sessionToken = encodeURIComponent(token || '');
+   try {
+-    const session = new EventSource('/api/browser-session?token=' + token);
++    const session = new EventSource('/api/browser-session?token=' + sessionToken);
+     session.onopen = () => appendLog('Browser session monitor connected', 'SeaVault will stop after this browser page closes when exit-on-browser-close is enabled.', 'success');
+     session.onerror = () => appendLog('Browser session monitor disconnected', 'SeaVault will stop shortly if no browser page reconnects.', 'warning');
+     window.addEventListener('beforeunload', () => session.close());

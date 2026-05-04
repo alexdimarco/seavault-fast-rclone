@@ -1,0 +1,132 @@
+diff --git a/internal/webui/server.go b/internal/webui/server.go
+index 0e867d3..088017a 100644
+--- a/internal/webui/server.go
++++ b/internal/webui/server.go
+@@ -2272,6 +2272,37 @@ function setProgress(done, total, text){ const p=$('progress'); p.max=Math.max(1
+ function setBusy(on){ document.body.classList.toggle('busy', !!on); document.querySelectorAll('button.operation').forEach(btn => { btn.disabled = !!on; }); }
+ function beginOperation(text){ if(activeController){ throw new Error('Another upload/export operation is already running. Cancel it or wait for it to finish.'); } activeCancelled=false; activeController = new AbortController(); setBusy(true); setProgress(0,1,text||'Starting...'); return activeController; }
+ function endOperation(text){ activeController=null; setBusy(false); setProgress(1,1,text||'Complete.'); }
++function uploadProgressText(prefix, sentBytes, totalBytes, suffix){
++  if(totalBytes > 0){
++    const pct = Math.floor((Math.min(sentBytes, totalBytes) / totalBytes) * 100);
++    return prefix + ' ' + fmtBytes(Math.min(sentBytes, totalBytes)) + ' of ' + fmtBytes(totalBytes) + ' (' + pct + '%)' + (suffix ? '. ' + suffix : '');
++  }
++  return prefix + (suffix ? ' ' + suffix : '');
++}
++function uploadRequest(method, url, body, headers, signal, onProgress){
++  return new Promise((resolve, reject) => {
++    const xhr = new XMLHttpRequest();
++    xhr.open(method, url, true);
++    Object.entries(headers || {}).forEach(([k,v]) => xhr.setRequestHeader(k, v));
++    xhr.upload.onprogress = evt => {
++      if(onProgress) onProgress(evt.loaded || 0, evt.lengthComputable ? evt.total : 0);
++    };
++    xhr.onload = () => resolve({
++      ok: xhr.status >= 200 && xhr.status < 300,
++      status: xhr.status,
++      statusText: xhr.statusText,
++      text: async () => xhr.responseText || '',
++      json: async () => JSON.parse(xhr.responseText || '{}')
++    });
++    xhr.onerror = () => reject(new Error('The browser could not complete the upload request.'));
++    xhr.onabort = () => reject(new DOMException('The browser upload was cancelled.', 'AbortError'));
++    if(signal){
++      if(signal.aborted){ xhr.abort(); return; }
++      signal.addEventListener('abort', () => xhr.abort(), {once:true});
++    }
++    xhr.send(body || null);
++  });
++}
+ function cancelActive(){ if(activeController){ activeCancelled=true; activeController.abort(); setBusy(false); showError('Cancelling operation', 'The active browser request was cancelled. The server checks cancellation between files.'); } else { showHuman('No active operation', 'There is no running upload or export to cancel.'); } }
+ function clearOutput(){ $('message').className=''; $('message').textContent='Ready.'; setProgress(0,1,'No active operation.'); }
+ async function api(path, opts){
+@@ -2534,26 +2565,37 @@ async function uploadFiles(inputId, preserveFolders){
+   try {
+     if(!input.files || input.files.length === 0){ showError('Nothing selected', preserveFolders ? 'Choose a browser folder first. The selected folder name is preserved automatically.' : 'Select one or more browser files first.'); return; }
+     const files = Array.from(input.files);
++    const totalBytes = fileSizeTotal(files);
+     const batchSize = preserveFolders ? 40 : 80;
+     const batches = [];
+     for(let i=0; i<files.length; i+=batchSize) batches.push(files.slice(i,i+batchSize));
+     ctl = beginOperation('Uploading 0 of ' + files.length + ' selected file(s)...');
+     let allResults = [];
++    let completedBytes = 0;
++    let completedFiles = 0;
+     for(let b=0; b<batches.length; b++){
+       if(activeCancelled) throw new Error('upload cancelled');
+       const fd = new FormData();
+       fd.append('path', $('uploadPath').value);
+-      for(const f of batches[b]){
++      const batch = batches[b];
++      const batchBytes = fileSizeTotal(batch);
++      for(const f of batch){
+         if(preserveFolders) fd.append('relpaths', f.webkitRelativePath || f.name);
+         fd.append('files', f, f.name);
+       }
+-      setProgress(Math.min(b*batchSize, files.length), files.length, 'Uploading batch ' + (b+1) + ' of ' + batches.length + '...');
+-      const res = await fetch('/api/upload',{method:'POST',headers:{'X-SeaVault-Token':token},body:fd,signal:ctl.signal});
++      const batchLabel = 'batch ' + (b+1) + ' of ' + batches.length + ', files ' + (completedFiles+1) + '-' + (completedFiles+batch.length) + ' of ' + files.length;
++      setProgress(totalBytes > 0 ? completedBytes : completedFiles, totalBytes > 0 ? totalBytes : files.length, uploadProgressText('Uploading', completedBytes, totalBytes, batchLabel));
++      const res = await uploadRequest('POST', '/api/upload', fd, {'X-SeaVault-Token':token}, ctl.signal, loaded => {
++        const sent = completedBytes + Math.min(loaded || 0, batchBytes || loaded || 0);
++        setProgress(totalBytes > 0 ? sent : completedFiles, totalBytes > 0 ? totalBytes : files.length, uploadProgressText('Uploading', sent, totalBytes, batchLabel));
++      });
+       let body;
+       try { body = await res.json(); } catch(_) { body = {error: await res.text()}; }
+       if(!res.ok) throw new Error(body.error || res.statusText);
+       allResults = allResults.concat(body.results || []);
+-      setProgress(Math.min((b+1)*batchSize, files.length), files.length, 'Uploaded ' + Math.min((b+1)*batchSize, files.length) + ' of ' + files.length + ' file(s).');
++      completedBytes += batchBytes;
++      completedFiles += batch.length;
++      setProgress(totalBytes > 0 ? completedBytes : completedFiles, totalBytes > 0 ? totalBytes : files.length, uploadProgressText('Uploaded', completedBytes, totalBytes, completedFiles + ' of ' + files.length + ' file(s) accepted by the server.'));
+     }
+     const summary = {method:'browser-batched', results:allResults};
+     input.value='';
+@@ -2563,11 +2605,12 @@ async function uploadFiles(inputId, preserveFolders){
+     await refreshFiles();
+   } catch(e){
+     if(e.name === 'AbortError') showError('Upload cancelled', 'The browser upload was cancelled. Files already imported before cancellation remain in the vault.');
+-    else showError('Upload failed', e.message + '\n\nFor very large folders, use the local path ingest field. It lets the local GUI server read the folder directly and avoids browser upload limits.');
++    else showError('Upload failed', e.message + '\\n\\nFor very large folders, use the local path ingest field. It lets the local GUI server read the folder directly and avoids browser upload limits.');
+     activeController = null;
+     setBusy(false);
+   }
+ }
++
+ async function uploadLocalPath(){
+   let ctl;
+   try {
+@@ -2785,20 +2828,30 @@ async function uploadDavItems(items){
+   try{
+     let uploaded=0;
+     let createdDirs=0;
++    const fileItems = items.filter(item => item && item.file);
++    const totalBytes = fileItems.reduce((n,item)=>n+((item.file && item.file.size) || 0),0);
++    let completedBytes = 0;
+     for(let i=0;i<items.length;i++){
+       const item=items[i];
+       const rel=String(item.rel || (item.file && item.file.name) || '').replace(/^\/+|\/+$|^\.+$/g, '');
+       if(!rel) continue;
+       const dest=[currentDavPath || 'content', rel].filter(Boolean).join('/');
+       if(item.dir){
+-        setProgress(i, items.length, 'Creating folder ' + rel);
++        setProgress(totalBytes > 0 ? completedBytes : i, totalBytes > 0 ? totalBytes : items.length, 'Creating folder ' + rel + ' (' + (i+1) + ' of ' + items.length + ')');
+         try { await davFetch('MKCOL', dest, {signal:ctl.signal}); } catch(e) { if(!/already exists|405|Method Not Allowed/i.test(String(e && e.message || e))) throw e; }
+         createdDirs++;
+         continue;
+       }
+-      setProgress(i, items.length, 'Uploading ' + (i+1) + ' of ' + items.length + ': ' + rel);
+-      await davFetch('PUT', dest, {body:item.file, signal:ctl.signal});
++      const fileSize = (item.file && item.file.size) || 0;
++      setProgress(totalBytes > 0 ? completedBytes : i, totalBytes > 0 ? totalBytes : items.length, uploadProgressText('Uploading', completedBytes, totalBytes, (i+1) + ' of ' + items.length + ': ' + rel));
++      const res = await uploadRequest('PUT', davURL(dest), item.file, {'X-SeaVault-Token':token}, ctl.signal, loaded => {
++        const sent = completedBytes + Math.min(loaded || 0, fileSize || loaded || 0);
++        setProgress(totalBytes > 0 ? sent : i, totalBytes > 0 ? totalBytes : items.length, uploadProgressText('Uploading', sent, totalBytes, (i+1) + ' of ' + items.length + ': ' + rel));
++      });
++      if(!res.ok) throw new Error(await res.text() || res.statusText);
++      completedBytes += fileSize;
+       uploaded++;
++      setProgress(totalBytes > 0 ? completedBytes : i+1, totalBytes > 0 ? totalBytes : items.length, uploadProgressText('Uploaded', completedBytes, totalBytes, uploaded + ' file(s) complete.'));
+     }
+     endOperation('WebDAV upload complete.');
+     showHuman('WebDAV upload complete', 'Uploaded ' + uploaded + ' file(s) and created ' + createdDirs + ' folder(s) in ' + (currentDavPath || 'content') + '.', 'success');

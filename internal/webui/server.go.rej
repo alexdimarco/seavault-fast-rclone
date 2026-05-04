@@ -1,45 +1,66 @@
---- internal/webui/server.go	2026-05-04 16:30:34.000000000 +0000
-+++ internal/webui/server.go	2026-05-04 18:24:31.333962707 +0000
-@@ -1946,23 +2029,28 @@
- <body>
- <header>
-   <div class="header-row">
--    <div>
--      <h1>SeaVault Fast</h1>
--      <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
-+    <div class="header-main">
-+      <div class="brand-lockup">
-+        <div class="brand-logo" aria-hidden="true"><span class="brand-glyph">C</span></div>
-+        <div class="brand-copy">
-+          <div class="brand-eyebrow">Crescendum secure workspace</div>
-+          <h1 class="brand-title">SeaVault Fast</h1>
-+          <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
-+        </div>
-+      </div>
-+      <nav class="header-nav" aria-label="Primary navigation">
-+        <a href="#vault-panel">Vault</a>
-+        <a href="#upload-panel">Upload</a>
-+        <a href="#move-panel">Move vault</a>
-+        <a href="#export-panel">Export</a>
-+        <a href="#files-panel">WebDAV files</a>
-+        <a href="#remote-panel">Remote</a>
-+        <a href="#managed-tools-panel">Managed tools</a>
-+        <a href="#keys-panel">SSH keys</a>
-+      </nav>
-     </div>
-     <a class="settings-button" href="#settings-panel">Settings</a>
-   </div>
--  <nav class="jump-links" aria-label="Page sections">
--    <a href="#vault-panel">Vault</a>
--    <a href="#upload-panel">Upload</a>
--    <a href="#move-panel">Move vault</a>
--    <a href="#export-panel">Export</a>
--    <a href="/files/">WebDAV files</a>
--    <a href="#remote-panel">Remote</a>
--    <a href="#settings-panel">Settings</a>
--    <a href="#managed-tools-panel">Managed tools</a>
--    <a href="#keys-panel">SSH keys</a>
--  </nav>
-   <div id="compatWarning" class="compat-warning" role="alert"></div>
- </header>
- <main class="app-shell">
+--- internal/webui/server.go	2026-05-04 21:43:08.000000000 +0000
++++ internal/webui/server.go	2026-05-04 22:00:17.989275138 +0000
+@@ -325,16 +326,17 @@
+ func (s *Server) ShutdownNotify() <-chan struct{} { return s.shutdownCh }
+ 
+ func (s *Server) watchBrowserHeartbeat() {
+-	ticker := time.NewTicker(5 * time.Second)
++	ticker := time.NewTicker(2 * time.Second)
+ 	defer ticker.Stop()
+ 	for range ticker.C {
+ 		s.mu.Lock()
+ 		enabled := s.browserCloseEnabled
+ 		seen := s.browserSeen
++		sessions := s.browserSessions
+ 		last := s.lastBrowserHeartbeat
+ 		timeout := s.browserCloseTimeout
+ 		s.mu.Unlock()
+-		if !enabled || !seen || timeout <= 0 {
++		if !enabled || !seen || timeout <= 0 || sessions > 0 {
+ 			continue
+ 		}
+ 		if time.Since(last) > timeout {
+@@ -2036,11 +2090,11 @@
+ 			if !s.keychainStatus.Available {
+ 				st.KeychainStatus = "unavailable"
+ 				st.KeychainError = s.keychainStatus.Detail
+-			} else if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
+-				st.Keychain = true
+-				st.KeychainStatus = "active"
+ 			} else {
+-				st.KeychainStatus = "not saved"
++				// Do not read the secret here. On Linux, secret-tool lookup can block
++				// behind a locked desktop keyring and hang /api/status. The UI may
++				// try keychain open on demand and fall back to the password dialog.
++				st.KeychainStatus = "available"
+ 			}
+ 		}
+ 		if st.Open {
+@@ -3452,13 +3506,26 @@
+   } catch(e){ showError('Could not refresh saved vaults', e.message); }
+ }
+ function startBrowserHeartbeat(){
++  let eventStreamStarted = false;
++  if(window.EventSource){
++    try {
++      const es = new EventSource('/api/browser-session');
++      eventStreamStarted = true;
++      es.onopen = () => { try { appendLog('Browser session monitor connected', 'SeaVault will stop after this page closes.'); } catch(_) {} };
++      es.onerror = () => { try { appendLog('Browser session monitor warning', 'The browser session stream disconnected; heartbeat fallback remains active.', 'warning'); } catch(_) {} };
++      window.addEventListener('pagehide', () => { try { es.close(); } catch(_) {} });
++      window.addEventListener('beforeunload', () => { try { es.close(); } catch(_) {} });
++    } catch(err) {
++      try { appendLog('Browser session monitor unavailable', err && err.message ? err.message : String(err), 'warning'); } catch(_) {}
++    }
++  }
+   const beat = () => {
+     fetch('/api/browser-heartbeat', {method:'POST', keepalive:true, cache:'no-store'}).catch(err => {
+       try { appendLog('Browser heartbeat failed', err && err.message ? err.message : String(err), 'warning'); } catch (_) {}
+     });
+   };
+   beat();
+-  window.setInterval(beat, 10000);
++  window.setInterval(beat, eventStreamStarted ? 15000 : 5000);
+ }
+ async function saveCurrentVaultProfile(){
+   try {
