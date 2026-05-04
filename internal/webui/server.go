@@ -11,6 +11,7 @@ import (
 	"html/template"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -20,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/seavault-fast/internal/appconfig"
+	"github.com/example/seavault-fast/internal/dependencies"
 	"github.com/example/seavault-fast/internal/importer"
 	"github.com/example/seavault-fast/internal/keychain"
 	"github.com/example/seavault-fast/internal/localdav"
@@ -44,6 +47,7 @@ type Server struct {
 	token          string
 	webdavReadOnly bool
 	keychainStatus keychain.Status
+	config         appconfig.Config
 }
 
 type apiError struct {
@@ -136,17 +140,29 @@ type sshKeyRequest struct {
 	Path string `json:"path"`
 }
 
+type appConfigRequest struct {
+	Config      appconfig.Config `json:"config"`
+	GUIPassword string           `json:"guiPassword"`
+}
+
+type logSaveRequest struct {
+	Path string `json:"path"`
+	Text string `json:"text"`
+}
+
 type statusResponse struct {
-	Open            bool             `json:"open"`
-	BrowserToken    string           `json:"browserToken,omitempty"`
-	WebDAV          webdavStatusDTO  `json:"webdav"`
-	VaultPath       string           `json:"vaultPath,omitempty"`
-	VaultID         string           `json:"vaultId,omitempty"`
-	Config          *vaultConfigDTO  `json:"config,omitempty"`
-	Profiles        []profile.Entry  `json:"profiles"`
-	AvailableVaults []vaultStatusDTO `json:"availableVaults"`
-	SuggestedPaths  []string         `json:"suggestedPaths"`
-	KeychainStatus  keychain.Status  `json:"keychainStatus"`
+	Open            bool                `json:"open"`
+	BrowserToken    string              `json:"browserToken,omitempty"`
+	WebDAV          webdavStatusDTO     `json:"webdav"`
+	VaultPath       string              `json:"vaultPath,omitempty"`
+	VaultID         string              `json:"vaultId,omitempty"`
+	Config          *vaultConfigDTO     `json:"config,omitempty"`
+	Profiles        []profile.Entry     `json:"profiles"`
+	AvailableVaults []vaultStatusDTO    `json:"availableVaults"`
+	SuggestedPaths  []string            `json:"suggestedPaths"`
+	KeychainStatus  keychain.Status     `json:"keychainStatus"`
+	AppConfig       appconfig.Config    `json:"appConfig"`
+	Dependencies    dependencies.Report `json:"dependencies"`
 }
 
 type webdavStatusDTO struct {
@@ -240,11 +256,20 @@ type exportRequest struct {
 }
 
 func New(initialVault string) (*Server, error) {
+	cfg, err := appconfig.Load()
+	if err != nil {
+		return nil, err
+	}
+	return NewWithConfig(initialVault, cfg)
+}
+
+func NewWithConfig(initialVault string, cfg appconfig.Config) (*Server, error) {
 	token, err := randomToken()
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{token: token, keychainStatus: keychain.Check()}
+	cfg = appconfig.Normalize(cfg)
+	s := &Server{token: token, keychainStatus: keychain.Check(), config: cfg}
 	if strings.TrimSpace(initialVault) != "" {
 		resolved, err := resolveVaultArg(initialVault)
 		if err != nil {
@@ -342,6 +367,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleSSHKeys(w, r)
 	case "/api/ssh-key-public":
 		s.handleSSHKeyPublic(w, r)
+	case "/api/app-config":
+		s.handleAppConfig(w, r)
+	case "/api/dependencies":
+		s.handleDependencies(w, r)
+	case "/api/log/save":
+		s.handleSaveLog(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -374,7 +405,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		cfgDTO = &vaultConfigDTO{Version: cfg.Version, KDF: cfg.KDF, Crypto: cfg.Crypto, Chunk: cfg.Chunk, CreatedAt: cfg.CreatedAt, ManifestMode: cfg.Crypto.ManifestMode}
 	}
 	s.mu.Unlock()
-	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths(), KeychainStatus: s.keychainStatus}
+	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths(), KeychainStatus: s.keychainStatus, AppConfig: s.currentConfig(), Dependencies: dependencies.Check()}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1321,6 +1352,107 @@ func (s *Server) handleSSHKeyPublic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"publicKey": pub})
 }
 
+func (s *Server) currentConfig() appconfig.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.config
+}
+
+func (s *Server) handleDependencies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, dependencies.Check())
+}
+
+func (s *Server) handleAppConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"config": s.currentConfig(), "path": mustConfigPath()})
+	case http.MethodPost:
+		var req appConfigRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		cfg := appconfig.Normalize(req.Config)
+		if strings.EqualFold(cfg.GUI.Protocol, "https") {
+			host := r.Host
+			if h, _, err := net.SplitHostPort(r.Host); err == nil {
+				host = h
+			}
+			var err error
+			cfg, err = appconfig.EnsureSelfSignedCertificate(cfg, host)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+				return
+			}
+		}
+		if strings.TrimSpace(req.GUIPassword) != "" {
+			if !s.keychainStatus.Available {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: keychainUnavailableMessage(s.keychainStatus)})
+				return
+			}
+			if err := keychain.Set("seavault-gui-http-auth", req.GUIPassword); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: "GUI password was not saved to the OS keychain: " + err.Error()})
+				return
+			}
+			cfg.GUI.PasswordConfigured = true
+		}
+		if err := appconfig.Save(cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+			return
+		}
+		s.mu.Lock()
+		s.config = cfg
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "config": cfg, "path": mustConfigPath(), "restartRequired": true})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *Server) handleSaveLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req logSaveRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	logPath := strings.TrimSpace(req.Path)
+	if logPath == "" {
+		logPath = strings.TrimSpace(s.currentConfig().Log.FilePath)
+	}
+	if logPath == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "log path is required"})
+		return
+	}
+	resolved, err := userpath.Abs(logPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(resolved), 0o700); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+	if err := os.WriteFile(resolved, []byte(req.Text), 0o600); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": resolved})
+}
+
+func mustConfigPath() string {
+	p, err := appconfig.Path()
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
 func (s *Server) tokenValue() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1639,6 +1771,8 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body { margin: 0; background: var(--bg); color: var(--fg); line-height: 1.45; }
 header { padding: 18px clamp(14px, 3vw, 28px); border-bottom: 1px solid var(--border); background: var(--panel); }
+.header-row { display:flex; justify-content:space-between; gap:16px; align-items:start; }
+.settings-button { white-space:nowrap; text-decoration:none; padding:10px 12px; border-radius:10px; border:1px solid var(--button-border); background:var(--button); color:var(--fg); }
 header h1 { margin: 0 0 6px; font-size: clamp(1.45rem, 2.6vw, 2rem); }
 header p { max-width: 1120px; margin: 0; color: var(--muted); }
 .app-shell { max-width: 1560px; margin: 0 auto; padding: clamp(12px, 2.4vw, 24px); display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 420px); gap: clamp(12px, 2vw, 20px); align-items: start; }
@@ -1686,6 +1820,10 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 .status-error, .status-missing { border-color: var(--danger); background: color-mix(in srgb, var(--danger-bg) 55%, var(--panel-2)); }
 .status-warning { border-color: var(--button-border); background: color-mix(in srgb, var(--button) 70%, var(--panel-2)); }
 .dependency-status { margin: 10px 0 14px; }
+.settings-grid { display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); align-items:start; }
+.settings-box { max-height: 520px; overflow:auto; border:1px solid var(--border); border-radius:12px; padding:12px; background:var(--panel-2); }
+.log-view { min-height: 240px; max-height: 520px; overflow:auto; }
+.webdav-indicator { margin-top:10px; }
 .dependency-status small { display: block; margin-top: 4px; }
 .jump-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .jump-links a { color: var(--focus); text-decoration: none; padding: 4px 0; }
@@ -1724,8 +1862,13 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 </head>
 <body>
 <header>
-  <h1>SeaVault Fast</h1>
-  <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
+  <div class="header-row">
+    <div>
+      <h1>SeaVault Fast</h1>
+      <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
+    </div>
+    <a class="settings-button" href="#settings-panel">Settings</a>
+  </div>
   <nav class="jump-links" aria-label="Page sections">
     <a href="#vault-panel">Vault</a>
     <a href="#upload-panel">Upload</a>
@@ -1733,6 +1876,7 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
     <a href="#export-panel">Export</a>
     <a href="/files/">WebDAV files</a>
     <a href="#remote-panel">Remote</a>
+    <a href="#settings-panel">Settings</a>
     <a href="#managed-tools-panel">Managed tools</a>
     <a href="#keys-panel">SSH keys</a>
   </nav>
@@ -2040,6 +2184,62 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <p class="row-actions"><button onclick="generateSSHKey()">Generate/import key</button><button onclick="loadSSHKeys()">Refresh keys</button></p>
   <div id="sshKeys" class="table-wrap"></div>
 </section>
+<section id="settings-panel">
+  <h2>Settings</h2>
+  <p class="hint">Application settings are saved locally. Changing HTTP/HTTPS or certificate settings requires restarting the GUI.</p>
+  <div class="settings-grid">
+    <div class="settings-box">
+      <h3>Local dependencies</h3>
+      <div id="keychainStatusBox" class="dependency-status"><p class="hint">Dependency status will appear after refresh.</p></div>
+      <div id="dependencyList"><p class="hint">Dependency list will appear after refresh.</p></div>
+    </div>
+    <div class="settings-box">
+      <h3>WebDAV details</h3>
+      <div id="webdavStatusBox"><p class="hint">WebDAV status will appear after refresh.</p></div>
+    </div>
+    <div class="settings-box">
+      <h3>GUI protocol and certificate</h3>
+      <div class="form-grid">
+        <label>Protocol
+          <select id="cfgProtocol"><option value="http">HTTP</option><option value="https">HTTPS</option></select>
+          <small>HTTPS uses the configured certificate, or creates a local self-signed certificate.</small>
+        </label>
+        <label class="checkline"><input id="cfgSelfSigned" type="checkbox"> Use or create self-signed certificate</label>
+        <label>Certificate file <input id="cfgCertFile" placeholder="blank creates app-managed certificate" autocomplete="off"></label>
+        <label>Private key file <input id="cfgKeyFile" placeholder="blank creates app-managed key" autocomplete="off"></label>
+      </div>
+      <h3>GUI user and password</h3>
+      <div class="form-grid">
+        <label>Username <input id="cfgUsername" autocomplete="username" placeholder="optional local GUI user"></label>
+        <label>Password <input id="cfgPassword" type="password" autocomplete="new-password" placeholder="stored in OS keychain when set"></label>
+      </div>
+      <p class="hint">Password values are stored in the OS keychain and are not written to the JSON configuration file.</p>
+    </div>
+    <div class="settings-box">
+      <h3>Log settings</h3>
+      <div class="form-grid">
+        <label>Maximum in-memory log entries <input id="cfgLogMax" type="number" min="10" max="5000" value="200"></label>
+        <label>Log file path <input id="cfgLogPath" placeholder="optional local log file path" autocomplete="off"></label>
+        <label class="checkline"><input id="cfgLogPersist" type="checkbox"> Save log to file until cleared</label>
+      </div>
+      <p class="row-actions"><button onclick="saveLogToFile()">Save log to file</button><button class="danger" onclick="clearLog()">Clear log</button></p>
+    </div>
+    <div class="settings-box">
+      <h3>Runtime and WSL sources</h3>
+      <div class="form-grid">
+        <label>Rclone release channel <input id="cfgRcloneChannel" placeholder="stable" autocomplete="off"></label>
+        <label>Rsync source base URL <input id="cfgRsyncSource" placeholder="https://download.samba.org/pub/rsync" autocomplete="off"></label>
+        <label>Rsync runtime base URL <input id="cfgRsyncRuntime" placeholder="https://.../seavault-rsync-runtime/releases/download" autocomplete="off"></label>
+        <label>Windows WSL install/update source <input id="cfgWSLSource" placeholder="wsl.exe --install" autocomplete="off"></label>
+      </div>
+      <p class="hint">On Windows, WSL is listed as a local dependency because rsync-backed local ingest needs a Linux-compatible rsync environment.</p>
+    </div>
+  </div>
+  <p class="row-actions"><button onclick="saveAppConfig()">Save settings</button><button onclick="loadAppConfig()">Reload settings</button></p>
+  <h3>Application log</h3>
+  <pre id="status" class="log-view">Loading...</pre>
+</section>
+
 </div>
 
 <aside class="result-panel" aria-live="polite" aria-label="Result and progress">
@@ -2048,14 +2248,11 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <progress id="progress" value="0" max="1"></progress>
   <p id="progressText"><small>No active operation.</small></p>
   <p class="row-actions"><button class="danger" onclick="cancelActive()">Cancel active operation</button><button class="secondary" onclick="clearOutput()">Clear</button><button class="secondary" onclick="refreshStatus()">Refresh vaults</button></p>
-  <h3>Local dependencies</h3>
-  <div id="keychainStatusBox" class="dependency-status"><p class="hint">Dependency status will appear after refresh.</p></div>
-  <h3>WebDAV file manager</h3>
-  <div id="webdavStatusBox"><p class="hint">WebDAV status will appear after refresh.</p></div>
+  <h3>WebDAV</h3>
+  <div id="webdavQuickBox" class="webdav-indicator"><p class="hint">WebDAV status will appear after refresh.</p></div>
   <h3>Available saved vaults</h3>
   <div id="availableVaults" class="vault-list">Loading saved vaults...</div>
-  <h3>Detailed result</h3>
-  <pre id="status">Loading...</pre>
+  <p class="hint">Detailed logs are available on the Settings page.</p>
 </aside>
 </main>
 <script>
@@ -2067,14 +2264,47 @@ let lastStatus = null;
 let currentDavPath = 'content';
 let selectedDavPath = '';
 let selectedDavIsDir = false;
+let appLog = [];
+let appConfig = null;
 function updateSessionToken(t){ if(t && t !== token){ token = t; document.documentElement.dataset.token = t; jsonHeaders = {'Content-Type':'application/json','X-SeaVault-Token':token}; } }
 function $(id){ return document.getElementById(id); }
 function setProgress(done, total, text){ const p=$('progress'); p.max=Math.max(1,total||1); p.value=Math.min(p.max,done||0); $('progressText').innerHTML='<small>'+esc(text||'')+'</small>'; }
 function setBusy(on){ document.body.classList.toggle('busy', !!on); document.querySelectorAll('button.operation').forEach(btn => { btn.disabled = !!on; }); }
 function beginOperation(text){ if(activeController){ throw new Error('Another upload/export operation is already running. Cancel it or wait for it to finish.'); } activeCancelled=false; activeController = new AbortController(); setBusy(true); setProgress(0,1,text||'Starting...'); return activeController; }
 function endOperation(text){ activeController=null; setBusy(false); setProgress(1,1,text||'Complete.'); }
+function uploadProgressText(prefix, sentBytes, totalBytes, suffix){
+  if(totalBytes > 0){
+    const pct = Math.floor((Math.min(sentBytes, totalBytes) / totalBytes) * 100);
+    return prefix + ' ' + fmtBytes(Math.min(sentBytes, totalBytes)) + ' of ' + fmtBytes(totalBytes) + ' (' + pct + '%)' + (suffix ? '. ' + suffix : '');
+  }
+  return prefix + (suffix ? ' ' + suffix : '');
+}
+function uploadRequest(method, url, body, headers, signal, onProgress){
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url, true);
+    Object.entries(headers || {}).forEach(([k,v]) => xhr.setRequestHeader(k, v));
+    xhr.upload.onprogress = evt => {
+      if(onProgress) onProgress(evt.loaded || 0, evt.lengthComputable ? evt.total : 0);
+    };
+    xhr.onload = () => resolve({
+      ok: xhr.status >= 200 && xhr.status < 300,
+      status: xhr.status,
+      statusText: xhr.statusText,
+      text: async () => xhr.responseText || '',
+      json: async () => JSON.parse(xhr.responseText || '{}')
+    });
+    xhr.onerror = () => reject(new Error('The browser could not complete the upload request.'));
+    xhr.onabort = () => reject(new DOMException('The browser upload was cancelled.', 'AbortError'));
+    if(signal){
+      if(signal.aborted){ xhr.abort(); return; }
+      signal.addEventListener('abort', () => xhr.abort(), {once:true});
+    }
+    xhr.send(body || null);
+  });
+}
 function cancelActive(){ if(activeController){ activeCancelled=true; activeController.abort(); setBusy(false); showError('Cancelling operation', 'The active browser request was cancelled. The server checks cancellation between files.'); } else { showHuman('No active operation', 'There is no running upload or export to cancel.'); } }
-function clearOutput(){ $('status').textContent=''; $('message').className=''; $('message').textContent='Ready.'; setProgress(0,1,'No active operation.'); }
+function clearOutput(){ $('message').className=''; $('message').textContent='Ready.'; setProgress(0,1,'No active operation.'); }
 async function api(path, opts){
   opts = opts || {};
   if(opts.method && opts.method !== 'GET') opts.headers = Object.assign({}, opts.headers || {}, {'X-SeaVault-Token': token});
@@ -2091,13 +2321,30 @@ async function api(path, opts){
 function showHuman(title, obj, level){
   $('message').className = level || '';
   $('message').textContent = title;
-  $('status').textContent = humanize(obj);
+  appendLog(title, humanize(obj), level || 'info');
 }
 function showError(title, detail){
   $('message').className = 'error';
   $('message').textContent = title;
-  $('status').textContent = detail || '';
+  appendLog(title, detail || '', 'error');
 }
+function appendLog(title, detail, level){
+  const max = Number((appConfig && appConfig.log && appConfig.log.maxEntries) || ($('cfgLogMax') && $('cfgLogMax').value) || 200);
+  appLog.push({time:new Date().toISOString(), level:level||'info', title:String(title||''), detail:String(detail||'')});
+  while(appLog.length > Math.max(10, max || 200)) appLog.shift();
+  renderLog();
+}
+function renderLog(){
+  const box = $('status');
+  if(!box) return;
+  box.textContent = appLog.map(e => '['+e.time+'] '+e.level.toUpperCase()+': '+e.title+(e.detail?'\n'+e.detail:'')).join('\n\n');
+  box.scrollTop = box.scrollHeight;
+}
+async function saveLogToFile(){
+  try { const path = $('cfgLogPath') ? $('cfgLogPath').value : ''; const res = await api('/api/log/save',{method:'POST',headers:jsonHeaders,body:JSON.stringify({path:path,text:($('status')?$('status').textContent:'')})}); showHuman('Log saved', res, 'success'); }
+  catch(e){ showError('Could not save log', e.message); }
+}
+function clearLog(){ appLog=[]; renderLog(); showHuman('Log cleared', 'Application log cleared from memory.'); }
 function humanize(obj){
   if(typeof obj === 'string') return obj;
   if(!obj) return '';
@@ -2181,6 +2428,44 @@ function renderKeychainStatus(status){
   box.innerHTML = '<div class="vault-card '+cls+'"><header><span class="vault-name">OS keychain</span><span class="pill">'+esc(st.available ? 'available' : 'unavailable')+'</span></header><small>Backend: '+esc(st.backend || 'unknown')+'</small>'+detail+missing+'</div>';
 }
 function keychainUnavailable(status){ return status && status.keychainStatus && !status.keychainStatus.available; }
+function renderDependencies(status){
+  const box = $('dependencyList');
+  if(!box) return;
+  const rows = (status && status.dependencies && status.dependencies.items) || [];
+  box.innerHTML = rows.map(d => '<div class="vault-card '+(d.available?'status-open':'status-missing')+'"><header><span class="vault-name">'+esc(d.name)+'</span><span class="pill">'+esc(d.summary||'unknown')+'</span></header>'+(d.detail?'<small>'+esc(d.detail)+'</small>':'')+'</div>').join('') || '<p class="hint">No dependency data.</p>';
+}
+function renderWebDAVQuick(status){
+  const box = $('webdavQuickBox');
+  if(!box) return;
+  const wd=(status&&status.webdav)||{};
+  box.innerHTML = '<div class="vault-card '+(wd.running?'status-open':'status-missing')+'"><header><span class="vault-name">WebDAV</span><span class="pill">'+(wd.running?'on':'off')+'</span></header><small>'+(wd.readOnly?'read-only':'read/write')+'</small></div>';
+}
+function renderAppConfig(status){
+  const cfg = (status && status.appConfig) || appConfig;
+  if(!cfg) return;
+  appConfig = cfg;
+  if($('cfgProtocol')) $('cfgProtocol').value = cfg.gui && cfg.gui.protocol ? cfg.gui.protocol : 'http';
+  if($('cfgSelfSigned')) $('cfgSelfSigned').checked = !!(cfg.gui && cfg.gui.selfSigned);
+  if($('cfgCertFile')) $('cfgCertFile').value = (cfg.gui && cfg.gui.certFile) || '';
+  if($('cfgKeyFile')) $('cfgKeyFile').value = (cfg.gui && cfg.gui.keyFile) || '';
+  if($('cfgUsername')) $('cfgUsername').value = (cfg.gui && cfg.gui.username) || '';
+  if($('cfgLogMax')) $('cfgLogMax').value = (cfg.log && cfg.log.maxEntries) || 200;
+  if($('cfgLogPath')) $('cfgLogPath').value = (cfg.log && cfg.log.filePath) || '';
+  if($('cfgLogPersist')) $('cfgLogPersist').checked = !!(cfg.log && cfg.log.persist);
+  if($('cfgRcloneChannel')) $('cfgRcloneChannel').value = (cfg.runtimeSources && cfg.runtimeSources.rcloneChannel) || 'stable';
+  if($('cfgRsyncSource')) $('cfgRsyncSource').value = (cfg.runtimeSources && cfg.runtimeSources.rsyncSourceBaseUrl) || '';
+  if($('cfgRsyncRuntime')) $('cfgRsyncRuntime').value = (cfg.runtimeSources && cfg.runtimeSources.rsyncRuntimeBaseUrl) || '';
+  if($('cfgWSLSource')) $('cfgWSLSource').value = (cfg.runtimeSources && cfg.runtimeSources.wslInstallSource) || '';
+}
+async function loadAppConfig(){ try { const res=await api('/api/app-config'); appConfig=res.config; renderAppConfig({appConfig:appConfig}); showHuman('Settings loaded', res); } catch(e){ showError('Could not load settings', e.message); } }
+async function saveAppConfig(){
+  try {
+    const cfg = {version:1, gui:{protocol:$('cfgProtocol').value, selfSigned:$('cfgSelfSigned').checked, certFile:$('cfgCertFile').value, keyFile:$('cfgKeyFile').value, username:$('cfgUsername').value, passwordConfigured: appConfig && appConfig.gui && appConfig.gui.passwordConfigured}, log:{maxEntries:Number($('cfgLogMax').value||200), filePath:$('cfgLogPath').value, persist:$('cfgLogPersist').checked}, runtimeSources:{rcloneChannel:$('cfgRcloneChannel').value, rsyncSourceBaseUrl:$('cfgRsyncSource').value, rsyncRuntimeBaseUrl:$('cfgRsyncRuntime').value, wslInstallSource:$('cfgWSLSource').value}};
+    const res=await api('/api/app-config',{method:'POST',headers:jsonHeaders,body:JSON.stringify({config:cfg, guiPassword:$('cfgPassword').value})});
+    $('cfgPassword').value=''; appConfig=res.config; renderAppConfig({appConfig:appConfig}); showHuman('Settings saved', res, 'success');
+  } catch(e){ showError('Could not save settings', e.message); }
+}
+
 function renderAvailableVaults(status){
   const box = $('availableVaults');
   if(!box) return;
@@ -2216,7 +2501,7 @@ async function openSavedVaultFromPassword(name, path, passwordId, saveKeychain){
 function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
 function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
 function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/user' || p.indexOf('/user/') === 0) return 'The path starts with /user. Use ~/Nextcloud/seavault, /Users/<name>/... on macOS, or /home/<name>/... on Linux.'; return ''; }
-async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderKeychainStatus(s); renderWebDAVStatus(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
+async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderKeychainStatus(s); renderDependencies(s); renderWebDAVStatus(s); renderWebDAVQuick(s); renderAppConfig(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
 async function saveCurrentVaultProfile(){
   try {
     const req = {name:$('profile').value, vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked};
@@ -2228,8 +2513,8 @@ async function saveCurrentVaultProfile(){
     await refreshStatus();
   } catch(e){ showError('Could not save vault', e.message); }
 }
-async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderWebDAVStatus(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
-async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderWebDAVStatus(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
+async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
+async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderDependencies(status); renderWebDAVStatus(status); renderWebDAVQuick(status); renderAppConfig(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
 async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshStatus(); } catch(e){ showError('Could not close vault', e.message); } }
 function fileSizeTotal(files){ return Array.from(files || []).reduce((n,f)=>n+(f.size||0),0); }
 function commonFolderRoot(files){
@@ -2280,26 +2565,37 @@ async function uploadFiles(inputId, preserveFolders){
   try {
     if(!input.files || input.files.length === 0){ showError('Nothing selected', preserveFolders ? 'Choose a browser folder first. The selected folder name is preserved automatically.' : 'Select one or more browser files first.'); return; }
     const files = Array.from(input.files);
+    const totalBytes = fileSizeTotal(files);
     const batchSize = preserveFolders ? 40 : 80;
     const batches = [];
     for(let i=0; i<files.length; i+=batchSize) batches.push(files.slice(i,i+batchSize));
     ctl = beginOperation('Uploading 0 of ' + files.length + ' selected file(s)...');
     let allResults = [];
+    let completedBytes = 0;
+    let completedFiles = 0;
     for(let b=0; b<batches.length; b++){
       if(activeCancelled) throw new Error('upload cancelled');
       const fd = new FormData();
       fd.append('path', $('uploadPath').value);
-      for(const f of batches[b]){
+      const batch = batches[b];
+      const batchBytes = fileSizeTotal(batch);
+      for(const f of batch){
         if(preserveFolders) fd.append('relpaths', f.webkitRelativePath || f.name);
         fd.append('files', f, f.name);
       }
-      setProgress(Math.min(b*batchSize, files.length), files.length, 'Uploading batch ' + (b+1) + ' of ' + batches.length + '...');
-      const res = await fetch('/api/upload',{method:'POST',headers:{'X-SeaVault-Token':token},body:fd,signal:ctl.signal});
+      const batchLabel = 'batch ' + (b+1) + ' of ' + batches.length + ', files ' + (completedFiles+1) + '-' + (completedFiles+batch.length) + ' of ' + files.length;
+      setProgress(totalBytes > 0 ? completedBytes : completedFiles, totalBytes > 0 ? totalBytes : files.length, uploadProgressText('Uploading', completedBytes, totalBytes, batchLabel));
+      const res = await uploadRequest('POST', '/api/upload', fd, {'X-SeaVault-Token':token}, ctl.signal, loaded => {
+        const sent = completedBytes + Math.min(loaded || 0, batchBytes || loaded || 0);
+        setProgress(totalBytes > 0 ? sent : completedFiles, totalBytes > 0 ? totalBytes : files.length, uploadProgressText('Uploading', sent, totalBytes, batchLabel));
+      });
       let body;
       try { body = await res.json(); } catch(_) { body = {error: await res.text()}; }
       if(!res.ok) throw new Error(body.error || res.statusText);
       allResults = allResults.concat(body.results || []);
-      setProgress(Math.min((b+1)*batchSize, files.length), files.length, 'Uploaded ' + Math.min((b+1)*batchSize, files.length) + ' of ' + files.length + ' file(s).');
+      completedBytes += batchBytes;
+      completedFiles += batch.length;
+      setProgress(totalBytes > 0 ? completedBytes : completedFiles, totalBytes > 0 ? totalBytes : files.length, uploadProgressText('Uploaded', completedBytes, totalBytes, completedFiles + ' of ' + files.length + ' file(s) accepted by the server.'));
     }
     const summary = {method:'browser-batched', results:allResults};
     input.value='';
@@ -2309,11 +2605,12 @@ async function uploadFiles(inputId, preserveFolders){
     await refreshFiles();
   } catch(e){
     if(e.name === 'AbortError') showError('Upload cancelled', 'The browser upload was cancelled. Files already imported before cancellation remain in the vault.');
-    else showError('Upload failed', e.message + '\n\nFor very large folders, use the local path ingest field. It lets the local GUI server read the folder directly and avoids browser upload limits.');
+    else showError('Upload failed', e.message + '\\n\\nFor very large folders, use the local path ingest field. It lets the local GUI server read the folder directly and avoids browser upload limits.');
     activeController = null;
     setBusy(false);
   }
 }
+
 async function uploadLocalPath(){
   let ctl;
   try {
@@ -2531,20 +2828,30 @@ async function uploadDavItems(items){
   try{
     let uploaded=0;
     let createdDirs=0;
+    const fileItems = items.filter(item => item && item.file);
+    const totalBytes = fileItems.reduce((n,item)=>n+((item.file && item.file.size) || 0),0);
+    let completedBytes = 0;
     for(let i=0;i<items.length;i++){
       const item=items[i];
       const rel=String(item.rel || (item.file && item.file.name) || '').replace(/^\/+|\/+$|^\.+$/g, '');
       if(!rel) continue;
       const dest=[currentDavPath || 'content', rel].filter(Boolean).join('/');
       if(item.dir){
-        setProgress(i, items.length, 'Creating folder ' + rel);
+        setProgress(totalBytes > 0 ? completedBytes : i, totalBytes > 0 ? totalBytes : items.length, 'Creating folder ' + rel + ' (' + (i+1) + ' of ' + items.length + ')');
         try { await davFetch('MKCOL', dest, {signal:ctl.signal}); } catch(e) { if(!/already exists|405|Method Not Allowed/i.test(String(e && e.message || e))) throw e; }
         createdDirs++;
         continue;
       }
-      setProgress(i, items.length, 'Uploading ' + (i+1) + ' of ' + items.length + ': ' + rel);
-      await davFetch('PUT', dest, {body:item.file, signal:ctl.signal});
+      const fileSize = (item.file && item.file.size) || 0;
+      setProgress(totalBytes > 0 ? completedBytes : i, totalBytes > 0 ? totalBytes : items.length, uploadProgressText('Uploading', completedBytes, totalBytes, (i+1) + ' of ' + items.length + ': ' + rel));
+      const res = await uploadRequest('PUT', davURL(dest), item.file, {'X-SeaVault-Token':token}, ctl.signal, loaded => {
+        const sent = completedBytes + Math.min(loaded || 0, fileSize || loaded || 0);
+        setProgress(totalBytes > 0 ? sent : i, totalBytes > 0 ? totalBytes : items.length, uploadProgressText('Uploading', sent, totalBytes, (i+1) + ' of ' + items.length + ': ' + rel));
+      });
+      if(!res.ok) throw new Error(await res.text() || res.statusText);
+      completedBytes += fileSize;
       uploaded++;
+      setProgress(totalBytes > 0 ? completedBytes : i+1, totalBytes > 0 ? totalBytes : items.length, uploadProgressText('Uploaded', completedBytes, totalBytes, uploaded + ' file(s) complete.'));
     }
     endOperation('WebDAV upload complete.');
     showHuman('WebDAV upload complete', 'Uploaded ' + uploaded + ' file(s) and created ' + createdDirs + ' folder(s) in ' + (currentDavPath || 'content') + '.', 'success');
@@ -2577,6 +2884,7 @@ function renderWebDAVStatus(status){
   if($('webdavReadOnly')) $('webdavReadOnly').checked = !!wd.readOnly;
   const selected = selectedDavPath ? (selectedDavIsDir?'folder ':'file ') + selectedDavPath : 'none';
   box.innerHTML = '<div class="vault-card '+(wd.running?'status-open':'status-missing')+'"><header><span class="vault-name">WebDAV</span><span class="pill">'+(wd.running?'running':'stopped')+'</span></header><small>Mode: '+(wd.readOnly?'read-only':'read/write')+'<br>Current path: '+esc(currentDavPath||'vault root')+'<br>Selected: '+esc(selected)+'</small><div class="vault-path">'+esc(wd.url||'Open a vault to start WebDAV')+'</div><progress value="'+(wd.running?1:0.15)+'" max="1"></progress></div>';
+  renderWebDAVQuick(status);
 }
 async function refreshFiles(){
   const box = $('files');
@@ -2655,7 +2963,7 @@ document.addEventListener('DOMContentLoaded', () => {
   updateUploadSelectionSummaries();
 });
 reportBrowserSupport();
-refreshStatus(); rsyncStatus(false); rcloneStatus(false); loadRemotes(); loadSSHKeys();
+appendLog('SeaVault GUI started','Ready.'); refreshStatus(); loadAppConfig(); rsyncStatus(false); rcloneStatus(false); loadRemotes(); loadSSHKeys();
 </script>
 </body>
 </html>`))

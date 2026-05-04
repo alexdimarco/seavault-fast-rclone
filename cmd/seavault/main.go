@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/example/seavault-fast/internal/appconfig"
 	"github.com/example/seavault-fast/internal/importer"
 	"github.com/example/seavault-fast/internal/keychain"
 	"github.com/example/seavault-fast/internal/localdav"
@@ -467,15 +469,39 @@ func cmdGUI(args []string) error {
 	if err := processguard.TerminateExistingSeaVaultProcesses(); err != nil {
 		return err
 	}
-	s, err := webui.New(initial)
+	cfg, err := appconfig.Load()
 	if err != nil {
 		return err
 	}
-	url := "http://" + *addr + "/"
+	if strings.EqualFold(cfg.GUI.Protocol, "https") {
+		host := *addr
+		if h, _, splitErr := net.SplitHostPort(*addr); splitErr == nil {
+			host = h
+		}
+		cfg, err = appconfig.EnsureSelfSignedCertificate(cfg, host)
+		if err != nil {
+			return err
+		}
+		if saveErr := appconfig.Save(cfg); saveErr != nil {
+			return saveErr
+		}
+	}
+	s, err := webui.NewWithConfig(initial, cfg)
+	if err != nil {
+		return err
+	}
+	scheme := "http"
+	if strings.EqualFold(cfg.GUI.Protocol, "https") {
+		scheme = "https"
+	}
+	url := scheme + "://" + *addr + "/"
 	fmt.Printf("serving local GUI at %s\n", url)
 	fmt.Println("bind is local by default; do not expose this listener on an untrusted network")
 	if !*noOpen {
 		_ = openBrowser(url)
+	}
+	if scheme == "https" {
+		return http.ListenAndServeTLS(*addr, cfg.GUI.CertFile, cfg.GUI.KeyFile, s)
 	}
 	return http.ListenAndServe(*addr, s)
 }
