@@ -700,3 +700,56 @@ func TestGuiAuthSessionAllowsIndexAndLogoutClearsSession(t *testing.T) {
 		t.Fatalf("logout should ask the browser to clear local site data")
 	}
 }
+
+func TestHelpPageAccessibleWithAuthEnabled(t *testing.T) {
+	s, err := NewWithConfig("", appconfig.Config{Version: appconfig.Version, GUI: appconfig.GUIConfig{Protocol: "http", Username: "alex", PasswordConfigured: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/help", nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("help page failed: %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "SeaVault help") || !strings.Contains(body, "Settings page") || !strings.Contains(body, "Reset password/config") {
+		t.Fatalf("help page missing expected content: %q", body)
+	}
+}
+
+func TestResetConfigClearsGuiAuthAndConfig(t *testing.T) {
+	cfg := appconfig.Config{Version: appconfig.Version, GUI: appconfig.GUIConfig{Protocol: "https", Username: "alex", PasswordConfigured: true}, Log: appconfig.LogConfig{MaxEntries: 77, Persist: true}}
+	if err := appconfig.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewWithConfig("", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.authSessions["session"] = time.Now().Add(time.Hour)
+
+	req := httptest.NewRequest(http.MethodPost, "/reset-config", strings.NewReader("confirm=RESET"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reset failed: %d %s", rr.Code, rr.Body.String())
+	}
+	if s.guiAuthEnabled() {
+		t.Fatalf("GUI auth should be disabled after reset")
+	}
+	if len(s.authSessions) != 0 {
+		t.Fatalf("reset should clear server-side sessions")
+	}
+	if got := rr.Header().Get("Clear-Site-Data"); got == "" {
+		t.Fatalf("reset should ask the browser to clear local site data")
+	}
+	loaded, err := appconfig.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.GUI.Username != "" || loaded.GUI.PasswordConfigured || loaded.GUI.Protocol != "http" || loaded.Log.MaxEntries != appconfig.Default().Log.MaxEntries {
+		t.Fatalf("config was not reset to defaults: %+v", loaded)
+	}
+}

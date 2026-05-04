@@ -35,6 +35,7 @@ type GUIConfig struct {
 	SelfSigned         bool   `json:"selfSigned"`
 	Username           string `json:"username"`
 	PasswordConfigured bool   `json:"passwordConfigured"`
+	PasswordHash       string `json:"passwordHash,omitempty"`
 }
 
 type LogConfig struct {
@@ -107,6 +108,14 @@ func Normalize(cfg Config) Config {
 	cfg.GUI.CertFile = strings.TrimSpace(cfg.GUI.CertFile)
 	cfg.GUI.KeyFile = strings.TrimSpace(cfg.GUI.KeyFile)
 	cfg.GUI.Username = strings.TrimSpace(cfg.GUI.Username)
+	cfg.GUI.PasswordHash = strings.TrimSpace(cfg.GUI.PasswordHash)
+	if cfg.GUI.PasswordHash != "" {
+		cfg.GUI.PasswordConfigured = true
+	}
+	if cfg.GUI.Username == "" {
+		cfg.GUI.PasswordConfigured = false
+		cfg.GUI.PasswordHash = ""
+	}
 	if cfg.Log.MaxEntries <= 0 {
 		cfg.Log.MaxEntries = def.Log.MaxEntries
 	}

@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 go test ./...
 go vet ./...
 go build -o bin/seavault ./cmd/seavault

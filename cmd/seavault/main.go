@@ -67,6 +67,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "gui":
 		err = cmdGUI(os.Args[2:])
+	case "app-config", "config":
+		err = cmdAppConfig(os.Args[2:])
 	case "profile":
 		err = cmdProfile(os.Args[2:])
 	case "move":
@@ -452,7 +454,76 @@ func cmdServe(args []string) error {
 	return http.ListenAndServe(*addr, localdav.New(v))
 }
 
+const guiAuthAccount = "seavault-gui-http-auth"
+
+func cmdAppConfig(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: seavault app-config path|reset|reset-gui-login")
+	}
+	switch args[0] {
+	case "path":
+		p, err := appconfig.Path()
+		if err != nil {
+			return err
+		}
+		fmt.Println(p)
+		return nil
+	case "reset", "reset-config":
+		return resetLocalAppConfiguration(true)
+	case "reset-gui-login", "clear-gui-login", "reset-password":
+		return resetLocalAppConfiguration(false)
+	default:
+		return fmt.Errorf("usage: seavault app-config path|reset|reset-gui-login")
+	}
+}
+
+func resetLocalAppConfiguration(resetAll bool) error {
+	if resetAll {
+		p, err := appconfig.Path()
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		_ = keychain.Delete(guiAuthAccount)
+		fmt.Printf("reset SeaVault local app configuration at %s\n", p)
+		fmt.Println("vault data, saved vault locations, vault passwords, SSH keys, and remotes were not deleted")
+		return nil
+	}
+	cfg, err := appconfig.Load()
+	if err != nil {
+		return err
+	}
+	cfg.GUI.Username = ""
+	cfg.GUI.PasswordConfigured = false
+	cfg.GUI.PasswordHash = ""
+	if err := appconfig.Save(cfg); err != nil {
+		return err
+	}
+	_ = keychain.Delete(guiAuthAccount)
+	p, _ := appconfig.Path()
+	fmt.Printf("reset SeaVault GUI login in %s\n", p)
+	fmt.Println("restart SeaVault or reload the GUI; browser sessions are invalidated when the server restarts")
+	return nil
+}
+
 func cmdGUI(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "reset", "reset-config":
+			return resetLocalAppConfiguration(true)
+		case "reset-login", "reset-password", "clear-login":
+			return resetLocalAppConfiguration(false)
+		case "config-path":
+			p, err := appconfig.Path()
+			if err != nil {
+				return err
+			}
+			fmt.Println(p)
+			return nil
+		}
+	}
 	fs := flag.NewFlagSet("gui", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8787", "local address for the browser GUI")
 	noOpen := fs.Bool("no-open", false, "do not open the browser automatically")
@@ -1254,6 +1325,8 @@ Usage:
   seavault stats [flags] VAULT_DIR_OR_PROFILE
   seavault serve [flags] VAULT_DIR_OR_PROFILE
   seavault gui [flags] [VAULT_DIR_OR_PROFILE]
+  seavault gui reset-config | reset-login | config-path
+  seavault app-config path | reset | reset-gui-login
   seavault profile add [--save-password] NAME VAULT_DIR
   seavault profile save [--save-password] NAME VAULT_DIR
   seavault profile move [--replace] [--update-remotes=true] NAME NEW_VAULT_DIR

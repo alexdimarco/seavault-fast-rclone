@@ -1,0 +1,45 @@
+--- internal/webui/server.go	2026-05-04 16:30:34.000000000 +0000
++++ internal/webui/server.go	2026-05-04 18:24:31.333962707 +0000
+@@ -1946,23 +2029,28 @@
+ <body>
+ <header>
+   <div class="header-row">
+-    <div>
+-      <h1>SeaVault Fast</h1>
+-      <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
++    <div class="header-main">
++      <div class="brand-lockup">
++        <div class="brand-logo" aria-hidden="true"><span class="brand-glyph">C</span></div>
++        <div class="brand-copy">
++          <div class="brand-eyebrow">Crescendum secure workspace</div>
++          <h1 class="brand-title">SeaVault Fast</h1>
++          <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
++        </div>
++      </div>
++      <nav class="header-nav" aria-label="Primary navigation">
++        <a href="#vault-panel">Vault</a>
++        <a href="#upload-panel">Upload</a>
++        <a href="#move-panel">Move vault</a>
++        <a href="#export-panel">Export</a>
++        <a href="#files-panel">WebDAV files</a>
++        <a href="#remote-panel">Remote</a>
++        <a href="#managed-tools-panel">Managed tools</a>
++        <a href="#keys-panel">SSH keys</a>
++      </nav>
+     </div>
+     <a class="settings-button" href="#settings-panel">Settings</a>
+   </div>
+-  <nav class="jump-links" aria-label="Page sections">
+-    <a href="#vault-panel">Vault</a>
+-    <a href="#upload-panel">Upload</a>
+-    <a href="#move-panel">Move vault</a>
+-    <a href="#export-panel">Export</a>
+-    <a href="/files/">WebDAV files</a>
+-    <a href="#remote-panel">Remote</a>
+-    <a href="#settings-panel">Settings</a>
+-    <a href="#managed-tools-panel">Managed tools</a>
+-    <a href="#keys-panel">SSH keys</a>
+-  </nav>
+   <div id="compatWarning" class="compat-warning" role="alert"></div>
+ </header>
+ <main class="app-shell">

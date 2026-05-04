@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -38,6 +40,7 @@ import (
 	"github.com/example/seavault-fast/internal/userpath"
 	"github.com/example/seavault-fast/internal/vault"
 	"github.com/example/seavault-fast/internal/vaultmove"
+	"github.com/example/seavault-fast/internal/xcrypto/argon2"
 )
 
 type Server struct {
@@ -53,6 +56,9 @@ type Server struct {
 
 const guiAuthAccount = "seavault-gui-http-auth"
 const guiSessionCookie = "seavault_gui_session"
+
+//go:embed assets/svlogo/*.png assets/svlogo/*.ico assets/svlogo/README.txt
+var svlogoAssets embed.FS
 
 type apiError struct {
 	Error string `json:"error"`
@@ -291,7 +297,67 @@ func NewWithConfig(initialVault string, cfg appconfig.Config) (*Server, error) {
 	return s, nil
 }
 
+func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := svlogoAssets.ReadFile("assets/svlogo/favicon.ico")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleSVLogoAsset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	clean := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/assets/svlogo/"))
+	if clean == "/" || strings.Contains(clean, "..") {
+		http.NotFound(w, r)
+		return
+	}
+	name := strings.TrimPrefix(clean, "/")
+	switch name {
+	case "logo.png", "icon.png", "favicon-32.png", "favicon-64.png", "favicon-180.png":
+		w.Header().Set("Content-Type", "image/png")
+	case "favicon.ico":
+		w.Header().Set("Content-Type", "image/x-icon")
+	case "README.txt":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	data, err := svlogoAssets.ReadFile("assets/svlogo/" + name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(data)
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/favicon.ico" {
+		s.handleFavicon(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/assets/svlogo/") {
+		s.handleSVLogoAsset(w, r)
+		return
+	}
 	if r.URL.Path == "/login" {
 		if r.Method == http.MethodPost {
 			s.handleLogin(w, r)
@@ -302,6 +368,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/logout" {
 		s.handleLogout(w, r)
+		return
+	}
+	if r.URL.Path == "/help" {
+		s.handleHelp(w, r)
+		return
+	}
+	if r.URL.Path == "/reset-config" {
+		if r.Method == http.MethodPost {
+			s.handleResetConfig(w, r)
+			return
+		}
+		s.handleResetConfigPage(w, r, "")
 		return
 	}
 	if s.guiAuthEnabled() && !s.requestAuthenticated(r) {
@@ -417,6 +495,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func hashGUIPassword(password string) (string, error) {
+	var salt [16]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return "", err
+	}
+	key := argon2.IDKey([]byte(password), salt[:], 2, 64*1024, 1, 32)
+	return "argon2id$v=1$t=2$m=65536$p=1$" + base64.RawStdEncoding.EncodeToString(salt[:]) + "$" + base64.RawStdEncoding.EncodeToString(key), nil
+}
+
+func verifyGUIPasswordHash(encoded, password string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 7 || parts[0] != "argon2id" || parts[1] != "v=1" || parts[2] != "t=2" || parts[3] != "m=65536" || parts[4] != "p=1" {
+		return false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[5])
+	if err != nil || len(salt) == 0 {
+		return false
+	}
+	stored, err := base64.RawStdEncoding.DecodeString(parts[6])
+	if err != nil || len(stored) == 0 {
+		return false
+	}
+	candidate := argon2.IDKey([]byte(password), salt, 2, 64*1024, 1, uint32(len(stored)))
+	return subtle.ConstantTimeCompare(candidate, stored) == 1
+}
+
 func (s *Server) guiAuthEnabled() bool {
 	cfg := s.currentConfig()
 	return strings.TrimSpace(cfg.GUI.Username) != "" && cfg.GUI.PasswordConfigured
@@ -464,13 +568,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 	username := strings.TrimSpace(r.FormValue("username"))
 	password := r.FormValue("password")
-	stored, err := keychain.Get(guiAuthAccount)
-	if err != nil {
-		s.handleLoginPage(w, r, "GUI password is configured, but SeaVault could not read it from the OS keychain: "+err.Error())
-		return
-	}
 	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(cfg.GUI.Username)) == 1
-	passOK := subtle.ConstantTimeCompare([]byte(password), []byte(stored)) == 1
+	passOK := false
+	if strings.TrimSpace(cfg.GUI.PasswordHash) != "" {
+		passOK = verifyGUIPasswordHash(cfg.GUI.PasswordHash, password)
+	} else {
+		stored, err := keychain.Get(guiAuthAccount)
+		if err != nil {
+			s.handleLoginPage(w, r, "GUI login is using a legacy OS-keychain password, but SeaVault could not read it. Use Reset password and app configuration, then set the GUI login password again. Keychain detail: "+err.Error())
+			return
+		}
+		passOK = subtle.ConstantTimeCompare([]byte(password), []byte(stored)) == 1
+	}
 	if !userOK || !passOK {
 		s.handleLoginPage(w, r, "Invalid SeaVault GUI username or password.")
 		return
@@ -502,6 +611,50 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (s *Server) handleHelp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = helpPage.Execute(w, struct{ AuthEnabled bool }{AuthEnabled: s.guiAuthEnabled()})
+}
+
+func (s *Server) handleResetConfigPage(w http.ResponseWriter, r *http.Request, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = resetConfigPage.Execute(w, struct{ Message string }{Message: message})
+}
+
+func (s *Server) handleResetConfig(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.handleResetConfigPage(w, r, "Could not read the reset form.")
+		return
+	}
+	if strings.TrimSpace(r.FormValue("confirm")) != "RESET" {
+		s.handleResetConfigPage(w, r, "Type RESET exactly to reset the local application configuration and GUI login.")
+		return
+	}
+	if p, err := appconfig.Path(); err == nil && strings.TrimSpace(p) != "" {
+		if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
+			s.handleResetConfigPage(w, r, "Could not remove app configuration: "+rmErr.Error())
+			return
+		}
+	}
+	_ = keychain.Delete(guiAuthAccount)
+	newToken := mustRandomToken(s.tokenValue())
+	s.mu.Lock()
+	s.config = appconfig.Default()
+	s.authSessions = make(map[string]time.Time)
+	s.token = newToken
+	s.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: guiSessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	w.Header().Set("Clear-Site-Data", `"cookies", "storage"`)
+	w.Header().Set("Cache-Control", "no-store")
+	s.handleResetConfigPage(w, r, "Local application configuration and GUI login were reset. Vault data, saved vault locations, vault passwords, SSH keys, and remotes were not deleted.")
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -1515,28 +1668,33 @@ func (s *Server) handleAppConfig(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		previousCfg := s.currentConfig()
+		if strings.TrimSpace(req.GUIPassword) == "" && strings.TrimSpace(cfg.GUI.PasswordHash) == "" && strings.TrimSpace(previousCfg.GUI.Username) == strings.TrimSpace(cfg.GUI.Username) {
+			cfg.GUI.PasswordHash = previousCfg.GUI.PasswordHash
+		}
 		if req.ClearGUILogin {
 			_ = keychain.Delete(guiAuthAccount)
 			cfg.GUI.Username = ""
 			cfg.GUI.PasswordConfigured = false
+			cfg.GUI.PasswordHash = ""
 		}
 		if strings.TrimSpace(req.GUIPassword) != "" {
 			if strings.TrimSpace(cfg.GUI.Username) == "" {
 				writeJSON(w, http.StatusBadRequest, apiError{Error: "GUI username is required when setting a GUI password"})
 				return
 			}
-			if !s.keychainStatus.Available {
-				writeJSON(w, http.StatusBadRequest, apiError{Error: keychainUnavailableMessage(s.keychainStatus)})
+			hash, err := hashGUIPassword(req.GUIPassword)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError{Error: "GUI password verifier could not be created: " + err.Error()})
 				return
 			}
-			if err := keychain.Set(guiAuthAccount, req.GUIPassword); err != nil {
-				writeJSON(w, http.StatusBadRequest, apiError{Error: "GUI password was not saved to the OS keychain: " + err.Error()})
-				return
-			}
+			cfg.GUI.PasswordHash = hash
 			cfg.GUI.PasswordConfigured = true
+			_ = keychain.Delete(guiAuthAccount)
 		}
 		if strings.TrimSpace(cfg.GUI.Username) == "" {
 			cfg.GUI.PasswordConfigured = false
+			cfg.GUI.PasswordHash = ""
 		}
 		if err := appconfig.Save(cfg); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
@@ -1866,6 +2024,8 @@ var loginPage = template.Must(template.New("login").Parse(`<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/assets/svlogo/favicon-180.png">
 <title>SeaVault Login</title>
 <style>
 :root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bg:#f7f7f5; --fg:#111827; --panel:#ffffff; --border:#d1d5db; --button:#fff1e8; --button-border:#e3b6a5; --danger:#b42318; }
@@ -1877,7 +2037,7 @@ p { line-height:1.45; }
 .error { color:var(--danger); border:1px solid #ef4444; background:#fff1f0; padding:10px 12px; border-radius:10px; }
 label { display:block; margin:14px 0; font-weight:600; }
 input { width:100%; box-sizing:border-box; margin-top:6px; border:1px solid var(--border); border-radius:10px; padding:12px; font:inherit; }
-button { border:1px solid var(--button-border); background:var(--button); border-radius:10px; padding:11px 16px; font:inherit; cursor:pointer; }
+button, a.button { display:inline-block; border:1px solid var(--button-border); background:var(--button); color:var(--fg); text-decoration:none; border-radius:10px; padding:11px 16px; font:inherit; cursor:pointer; margin:4px 6px 4px 0; }
 small { color:#4b5563; }
 </style>
 </head>
@@ -1891,7 +2051,141 @@ small { color:#4b5563; }
     <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
     <button type="submit">Log in</button>
   </form>
-  <p><small>Logout clears the SeaVault browser session and local site storage for this origin.</small></p>
+  <p><a class="button" href="/reset-config">Reset password and app configuration</a> <a class="button" href="/help">Help</a></p>
+  <p><small>Use reset if the configured GUI password is unavailable or the browser has a stale session. Logout clears the SeaVault browser session and local site storage for this origin.</small></p>
+</main>
+</body>
+</html>`))
+
+var resetConfigPage = template.Must(template.New("reset-config").Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/assets/svlogo/favicon-180.png">
+<title>Reset SeaVault configuration</title>
+<style>
+:root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bg:#f7f7f5; --fg:#111827; --panel:#ffffff; --border:#d1d5db; --button:#fff1e8; --button-border:#e3b6a5; --danger:#b42318; --muted:#4b5563; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1117; --fg:#f9fafb; --panel:#171a22; --border:#3b4252; --button:#33251f; --button-border:#704f43; --muted:#cbd5e1; } }
+body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg); }
+main { width:min(620px, calc(100vw - 32px)); max-height:calc(100vh - 48px); overflow:auto; background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:28px; box-shadow:0 8px 24px rgba(17,24,39,.08); }
+h1 { margin:0 0 8px; font-size:1.45rem; }
+p, li { line-height:1.45; }
+.message { border:1px solid var(--border); background:rgba(16,185,129,.08); padding:10px 12px; border-radius:10px; }
+.warning { border:1px solid #ef4444; background:#fff1f0; color:var(--danger); padding:10px 12px; border-radius:10px; }
+label { display:block; margin:14px 0; font-weight:600; }
+input { width:100%; box-sizing:border-box; margin-top:6px; border:1px solid var(--border); border-radius:10px; padding:12px; font:inherit; }
+button, a.button { display:inline-block; border:1px solid var(--button-border); background:var(--button); color:var(--fg); text-decoration:none; border-radius:10px; padding:11px 16px; font:inherit; cursor:pointer; }
+small { color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Reset SeaVault password and app configuration</h1>
+  {{if .Message}}<p class="message">{{.Message}}</p>{{end}}
+  <p class="warning">This resets only the local SeaVault application configuration and GUI login password. It does not delete encrypted vault data, saved vault locations, vault passwords, SSH keys, or remote repository profiles.</p>
+  <form method="post" action="/reset-config" autocomplete="off">
+    <label>Type RESET to confirm <input name="confirm" autocomplete="off" required></label>
+    <button type="submit">Reset password and app configuration</button>
+    <a class="button" href="/login">Back to login</a>
+    <a class="button" href="/help">Help</a>
+  </form>
+  <p><small>After reset, reload SeaVault and configure HTTP/HTTPS, GUI login, logging, runtime sources, and certificate settings again.</small></p>
+</main>
+</body>
+</html>`))
+
+var helpPage = template.Must(template.New("help").Parse(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/assets/svlogo/favicon-180.png">
+<title>SeaVault Help</title>
+<style>
+:root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bg:#f7f7f5; --fg:#111827; --panel:#ffffff; --panel-2:#f3f4f6; --border:#d1d5db; --muted:#4b5563; --button:#fff1e8; --button-border:#e3b6a5; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1117; --fg:#f9fafb; --panel:#171a22; --panel-2:#111827; --border:#3b4252; --muted:#cbd5e1; --button:#33251f; --button-border:#704f43; } }
+body { margin:0; background:var(--bg); color:var(--fg); }
+header { position:sticky; top:0; z-index:2; background:var(--panel); border-bottom:1px solid var(--border); padding:16px 24px; }
+main { padding:20px; max-width:1180px; margin:0 auto; }
+h1 { margin:0 0 8px; }
+h2 { margin-top:0; }
+p, li { line-height:1.48; }
+nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+a.button, nav a { display:inline-block; color:var(--fg); text-decoration:none; border:1px solid var(--button-border); background:var(--button); border-radius:10px; padding:8px 12px; }
+.help-grid { display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); align-items:start; }
+.help-box { border:1px solid var(--border); border-radius:14px; background:var(--panel); padding:16px; max-height:420px; overflow:auto; }
+.full { grid-column:1 / -1; max-height:520px; }
+code { background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:1px 4px; }
+small, .hint { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>SeaVault help</h1>
+  <p class="hint">Step-by-step reference for the local SeaVault GUI, settings, runtime dependencies, and recovery options.</p>
+  <nav aria-label="Help sections">
+    <a href="/">Main app</a>{{if .AuthEnabled}}<a href="/logout">Logout</a>{{end}}<a href="/reset-config">Reset password/config</a>
+    <a href="#vaults">Vaults</a><a href="#upload">Upload</a><a href="#webdav">WebDAV</a><a href="#settings">Settings</a><a href="#security">Security</a>
+  </nav>
+</header>
+<main>
+  <div class="help-grid">
+    <section id="vaults" class="help-box">
+      <h2>1. Vaults</h2>
+      <ol>
+        <li>Choose a saved vault or type a local vault path.</li>
+        <li>Enter the vault password, or leave it blank only when an OS keychain password is active for that vault.</li>
+        <li>Use <strong>Open typed vault</strong> for a manual path, <strong>Open selected using keychain</strong> for a saved keychain entry, or <strong>Create vault and open</strong> for a new vault.</li>
+        <li>Use <strong>Save vault location/password</strong> to add the vault to the selector and optionally store the password in the OS keychain.</li>
+      </ol>
+    </section>
+    <section id="upload" class="help-box">
+      <h2>2. Upload and import</h2>
+      <ol>
+        <li>Use browser file upload for normal files.</li>
+        <li>Use browser folder upload when the browser supports relative folder paths.</li>
+        <li>Use local path ingest for large local folders. Native import avoids rsync dependencies.</li>
+        <li>Use large local import for multi-GB or TB folder scans. The browser starts and monitors a backend job.</li>
+      </ol>
+    </section>
+    <section id="webdav" class="help-box">
+      <h2>3. WebDAV file manager</h2>
+      <ol>
+        <li>Open a vault first.</li>
+        <li>Start WebDAV in read/write or read-only mode.</li>
+        <li>Use the file manager for normal browsing, folder creation, drag/drop, download, and delete operations.</li>
+        <li>The protected <code>content/</code> directory is the default user workspace.</li>
+      </ol>
+    </section>
+    <section id="settings" class="help-box full">
+      <h2>4. Settings page</h2>
+      <ul>
+        <li><strong>Local dependencies:</strong> shows OS keychain, WSL, rsync, rclone, and other local runtime checks.</li>
+        <li><strong>WebDAV details:</strong> shows current WebDAV mode, path, URL, and file-manager state.</li>
+        <li><strong>GUI protocol and certificate:</strong> choose HTTP or HTTPS. HTTPS uses the configured certificate files or app-managed self-signed certificate files.</li>
+        <li><strong>GUI user and password:</strong> set local browser login. SeaVault stores a salted Argon2id password verifier in the local app configuration, not the plaintext password. Logout clears the browser session for this origin.</li>
+        <li><strong>Reset password and app configuration:</strong> clears the GUI login and local app config when a password is lost or settings need to return to defaults.</li>
+        <li><strong>Log settings:</strong> controls maximum in-memory entries, optional local log file path, persistent logging, manual save, and clear.</li>
+        <li><strong>Runtime and WSL sources:</strong> sets rclone channel, rsync source URLs, managed runtime URL, and WSL install/update source.</li>
+        <li><strong>Managed tools:</strong> install, register, update, or roll back managed rclone and rsync runtimes.</li>
+        <li><strong>SSH keys:</strong> generate or import keys for rclone SFTP remotes.</li>
+        <li><strong>Remote repositories:</strong> save rclone or local remote repository profiles and run push/pull operations.</li>
+      </ul>
+    </section>
+    <section id="security" class="help-box full">
+      <h2>5. Security and recovery</h2>
+      <ul>
+        <li>The vault password protects encrypted vault contents. The GUI login only protects the local browser interface.</li>
+        <li>OS keychain availability depends on platform dependencies such as Secret Service on Linux, Keychain on macOS, or Credential Manager on Windows.</li>
+        <li>Resetting GUI password/config does not decrypt or alter vault contents and does not remove saved vault password entries.</li>
+        <li>For forgotten vault passwords, reset does not help. The vault password must be known or stored in the OS keychain.</li>
+        <li>Use HTTPS with a self-signed certificate when local browser traffic must be encrypted. Trust warnings are expected unless the certificate is trusted locally.</li>
+      </ul>
+    </section>
+  </div>
 </main>
 </body>
 </html>`))
@@ -1901,25 +2195,27 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>SeaVault Fast</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/assets/svlogo/favicon-180.png">
+<title>SeaVault Fast | Crescendum</title>
 <style>
 :root {
   color-scheme: light dark;
-  --bg: #f7f7f5;
-  --fg: #111827;
-  --muted: #4b5563;
+  --bg: #eef3f8;
+  --fg: #10233d;
+  --muted: #486079;
   --panel: #ffffff;
-  --panel-2: #f3f4f6;
-  --border: #d1d5db;
+  --panel-2: #f5f9fc;
+  --border: #cdd9e5;
   --control: #ffffff;
-  --button: #fff1e8;
-  --button-border: #e3b6a5;
+  --button: #edf8fa;
+  --button-border: #6ec7ce;
   --danger: #b42318;
   --danger-bg: #fff1f0;
-  --success: #067647;
-  --success-bg: #ecfdf3;
-  --focus: #2563eb;
-  --shadow: 0 8px 24px rgba(17, 24, 39, .08);
+  --success: #0b7b6e;
+  --success-bg: #edfdfa;
+  --focus: #1461d2;
+  --shadow: 0 10px 30px rgba(16, 35, 61, .08);
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 @media (prefers-color-scheme: dark) {
@@ -1944,11 +2240,67 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body { margin: 0; background: var(--bg); color: var(--fg); line-height: 1.45; }
-header { padding: 18px clamp(14px, 3vw, 28px); border-bottom: 1px solid var(--border); background: var(--panel); }
-.header-row { display:flex; justify-content:space-between; gap:16px; align-items:start; }
-.settings-button { white-space:nowrap; text-decoration:none; padding:10px 12px; border-radius:10px; border:1px solid var(--button-border); background:var(--button); color:var(--fg); }
-header h1 { margin: 0 0 6px; font-size: clamp(1.45rem, 2.6vw, 2rem); }
-header p { max-width: 1120px; margin: 0; color: var(--muted); }
+header {
+  padding: 18px clamp(14px, 3vw, 28px);
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(135deg, #0d2340 0%, #16355d 48%, #0d6f7c 100%);
+  color: #f8fbff;
+}
+.header-row { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; }
+.settings-button, .header-nav a {
+  white-space:nowrap;
+  text-decoration:none;
+  padding:10px 14px;
+  border-radius:999px;
+  border:1px solid rgba(255,255,255,.18);
+  background: rgba(255,255,255,.1);
+  color:#f8fbff;
+  transition: background .2s ease, border-color .2s ease, transform .2s ease;
+}
+.settings-button:hover, .header-nav a:hover { background: rgba(255,255,255,.18); border-color: rgba(255,255,255,.28); transform: translateY(-1px); }
+.header-main { display:grid; gap:14px; min-width:0; }
+.header-actions { display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end; }
+.brand-lockup { display:flex; align-items:center; gap:16px; min-width:0; }
+.brand-logo-img {
+  width: min(340px, 42vw);
+  height: auto;
+  display: block;
+  border-radius: 14px;
+  background: #ffffff;
+  padding: 6px 10px;
+  box-shadow: 0 14px 28px rgba(0,0,0,.18);
+  flex: 0 0 auto;
+}
+.brand-icon-img {
+  width: 72px;
+  height: 72px;
+  display: block;
+  border-radius: 18px;
+  background: #ffffff;
+  padding: 4px;
+  box-shadow: 0 14px 28px rgba(0,0,0,.18);
+}
+.brand-copy { min-width:0; }
+.brand-eyebrow {
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  margin-bottom:4px;
+  font-size:.76rem;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:rgba(248,251,255,.76);
+}
+.brand-eyebrow::before {
+  content:"";
+  width:26px;
+  height:2px;
+  border-radius:999px;
+  background:#36d0d8;
+}
+.brand-title { margin:0 0 4px; font-size: clamp(1.7rem, 2.8vw, 2.35rem); line-height:1.05; }
+.brand-copy p { max-width: 76ch; margin: 0; color: rgba(248,251,255,.88); }
+.header-nav { display:flex; flex-wrap:wrap; gap:10px; margin-top: 6px; }
 .app-shell { max-width: 1560px; margin: 0 auto; padding: clamp(12px, 2.4vw, 24px); display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 420px); gap: clamp(12px, 2vw, 20px); align-items: start; }
 .content { display: grid; gap: 16px; min-width: 0; }
 section, aside { min-width: 0; border: 1px solid var(--border); border-radius: 16px; padding: clamp(14px, 2.2vw, 20px); background: var(--panel); box-shadow: var(--shadow); }
@@ -2025,6 +2377,10 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 }
 @media (max-width: 720px) {
   header { padding: 14px; }
+  .header-row { flex-direction: column; }
+  .brand-lockup { align-items:flex-start; }
+  .header-nav { width:100%; }
+  .settings-button, .header-nav a { width:100%; text-align:center; }
   .app-shell { padding: 12px; gap: 12px; }
   section, aside { border-radius: 12px; padding: 14px; }
   .row-actions { display: grid; grid-template-columns: 1fr; }
@@ -2037,11 +2393,17 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 <body>
 <header>
   <div class="header-row">
-    <div>
-      <h1>SeaVault Fast</h1>
-      <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
+    <div class="header-main">
+      <div class="brand-lockup">
+        <img class="brand-logo-img" src="/assets/svlogo/logo.png" alt="SeaVault Fast">
+        <div class="brand-copy">
+          <div class="brand-eyebrow">Crescendum secure workspace</div>
+          <h1 class="brand-title">SeaVault Fast</h1>
+          <p>The vault directory is the encrypted cloud-sync location. Put it inside OneDrive, Dropbox, Nextcloud, Syncthing, iCloud Drive, Google Drive, or any sync-client folder.</p>
+        </div>
+      </div>
     </div>
-    <a class="settings-button" href="#settings-panel">Settings</a>{{if .AuthEnabled}}<a class="settings-button" href="/logout">Logout</a>{{end}}
+    <div class="header-actions"><a class="settings-button" href="/help">Help</a><a class="settings-button" href="#settings-panel">Settings</a>{{if .AuthEnabled}}<a class="settings-button" href="/logout">Logout</a>{{end}}</div>
   </div>
   <nav class="jump-links" aria-label="Page sections">
     <a href="#vault-panel">Vault</a>
@@ -2051,6 +2413,7 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
     <a href="/files/">WebDAV files</a>
     <a href="#remote-panel">Remote</a>
     <a href="#settings-panel">Settings</a>
+    <a href="/help">Help</a>
     <a href="#managed-tools-panel">Managed tools</a>
     <a href="#keys-panel">SSH keys</a>
   </nav>
@@ -2388,8 +2751,8 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
         <label>Password <input id="cfgPassword" type="password" autocomplete="new-password" placeholder="stored in OS keychain when set"></label>
       </div>
       <p id="guiAuthStatus" class="hint">GUI login status will appear after settings load.</p>
-      <p class="row-actions"><button class="danger" onclick="clearGuiLogin()">Clear GUI login</button></p>
-      <p class="hint">Password values are stored in the OS keychain and are not written to the JSON configuration file. After enabling login, reload the page to use the login screen.</p>
+      <p class="row-actions"><button class="danger" onclick="clearGuiLogin()">Clear GUI login</button><a class="settings-button danger" href="/reset-config">Reset password and app configuration</a></p>
+      <p class="hint">SeaVault stores a salted Argon2id password verifier in local app configuration, not the plaintext password. This avoids OS-keychain dependency failures for GUI login. Use Reset password and app configuration if the GUI password is lost or the saved configuration should be restored to defaults.</p>
     </div>
     <div class="settings-box">
       <h3>Log settings</h3>
@@ -2637,7 +3000,7 @@ function renderAppConfig(status){
 async function loadAppConfig(){ try { const res=await api('/api/app-config'); appConfig=res.config; renderAppConfig({appConfig:appConfig}); showHuman('Settings loaded', res); } catch(e){ showError('Could not load settings', e.message); } }
 async function saveAppConfig(){
   try {
-    const cfg = {version:1, gui:{protocol:$('cfgProtocol').value, selfSigned:$('cfgSelfSigned').checked, certFile:$('cfgCertFile').value, keyFile:$('cfgKeyFile').value, username:$('cfgUsername').value, passwordConfigured: appConfig && appConfig.gui && appConfig.gui.passwordConfigured}, log:{maxEntries:Number($('cfgLogMax').value||200), filePath:$('cfgLogPath').value, persist:$('cfgLogPersist').checked}, runtimeSources:{rcloneChannel:$('cfgRcloneChannel').value, rsyncSourceBaseUrl:$('cfgRsyncSource').value, rsyncRuntimeBaseUrl:$('cfgRsyncRuntime').value, wslInstallSource:$('cfgWSLSource').value}};
+    const cfg = {version:1, gui:{protocol:$('cfgProtocol').value, selfSigned:$('cfgSelfSigned').checked, certFile:$('cfgCertFile').value, keyFile:$('cfgKeyFile').value, username:$('cfgUsername').value, passwordConfigured: appConfig && appConfig.gui && appConfig.gui.passwordConfigured, passwordHash: appConfig && appConfig.gui && appConfig.gui.passwordHash}, log:{maxEntries:Number($('cfgLogMax').value||200), filePath:$('cfgLogPath').value, persist:$('cfgLogPersist').checked}, runtimeSources:{rcloneChannel:$('cfgRcloneChannel').value, rsyncSourceBaseUrl:$('cfgRsyncSource').value, rsyncRuntimeBaseUrl:$('cfgRsyncRuntime').value, wslInstallSource:$('cfgWSLSource').value}};
     const res=await api('/api/app-config',{method:'POST',headers:jsonHeaders,body:JSON.stringify({config:cfg, guiPassword:$('cfgPassword').value})});
     $('cfgPassword').value=''; appConfig=res.config; renderAppConfig({appConfig:appConfig}); showHuman('Settings saved', res, 'success');
     if(res.authEnabled || (res.config && res.config.gui && res.config.gui.passwordConfigured)) showHuman('GUI login active', 'Reload this page or click Logout to verify the login landing page.', 'success');
@@ -2906,12 +3269,33 @@ async function refreshDavFiles(){
 function renderDavBreadcrumb(){
   const clean = currentDavPath || 'content';
   let parts = clean.split('/').filter(Boolean);
-  if(parts[0] === 'content') parts = parts.slice(1);
-  let acc = 'content';
-  let html = '<button onclick="openDavFolder(\'content\')">content</button>';
-  html += '<button onclick="selectCurrentDavFolder()">Select current folder</button>';
-  parts.forEach(part => { acc = acc + '/' + part; html += '<span>/</span><button data-path="'+esc(acc)+'" onclick="openDavFolder(this.dataset.path)">'+esc(part)+'</button>'; });
-  $('davBreadcrumb').innerHTML = html;
+  if(parts.length === 0) parts = ['content'];
+  if(parts[0] !== 'content') parts.unshift('content');
+  let acc = '';
+  const buttons = parts.map((part, idx) => {
+    acc = acc ? (acc + '/' + part) : part;
+    return (idx ? '<span class="crumb-sep">/</span>' : '') + '<button class="crumb-button" data-path="'+esc(acc)+'" onclick="openDavFolder(this.dataset.path)">'+esc(part)+'</button>';
+  }).join('');
+  const parent = parts.length > 1 ? parts.slice(0, -1).join('/') : 'content';
+  let tools = '<button onclick="selectCurrentDavFolder()">Select current folder</button>';
+  tools += '<button class="secondary" onclick="copyCurrentDavPath()">Copy full path</button>';
+  if(clean !== 'content') tools += '<button class="secondary" onclick="openDavFolder('+JSON.stringify(parent)+')">Up one level</button>';
+  $('davBreadcrumb').innerHTML =
+    '<div class="dav-toolbar">' +
+      '<div class="dav-toolbar-heading">' +
+        '<span class="dav-toolbar-label">Current virtual path</span>' +
+        '<span class="dav-toolbar-current">'+esc(clean)+'</span>' +
+      '</div>' +
+      '<div class="path-tools">' + tools + '</div>' +
+    '</div>' +
+    '<div class="full-path-bar">' + buttons + '</div>';
+}
+function copyCurrentDavPath(){
+  const clean = currentDavPath || 'content';
+  navigator.clipboard.writeText(clean).then(
+    () => showHuman('WebDAV path copied', clean, 'success'),
+    () => showError('Copy failed', 'The browser could not copy the current WebDAV path.')
+  );
 }
 function selectCurrentDavFolder(){
   selectedDavPath = currentDavPath || 'content';

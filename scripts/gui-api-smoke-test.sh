@@ -3,6 +3,8 @@ set -euo pipefail
 
 BIN="${1:-seavault}"
 WORK="$(mktemp -d)"
+export SEAVAULT_APP_HOME="$WORK/app-home"
+mkdir -p "$SEAVAULT_APP_HOME"
 ADDR="127.0.0.1:18787"
 URL="http://$ADDR"
 LOG="$WORK/gui.log"
