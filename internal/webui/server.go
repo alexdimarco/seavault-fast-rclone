@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/seavault-fast/internal/importer"
 	"github.com/example/seavault-fast/internal/keychain"
 	"github.com/example/seavault-fast/internal/localdav"
 	"github.com/example/seavault-fast/internal/profile"
@@ -221,6 +222,15 @@ type uploadPathRequest struct {
 	KeepStaging bool   `json:"keepStaging"`
 }
 
+type largeImportRequest struct {
+	SourcePath   string `json:"sourcePath"`
+	VirtualPath  string `json:"virtualPath"`
+	Method       string `json:"method"`
+	RsyncBinary  string `json:"rsyncBinary"`
+	DryRun       bool   `json:"dryRun"`
+	SkipExisting bool   `json:"skipExisting"`
+}
+
 type exportRequest struct {
 	VirtualPath string `json:"virtualPath"`
 	DestPath    string `json:"destPath"`
@@ -280,6 +290,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleUpload(w, r)
 	case "/api/upload-path":
 		s.handleUploadPath(w, r)
+	case "/api/import-large/start":
+		s.handleLargeImportStart(w, r)
+	case "/api/import-large/status":
+		s.handleLargeImportStatus(w, r)
+	case "/api/import-large/cancel":
+		s.handleLargeImportCancel(w, r)
 	case "/api/download":
 		s.handleDownload(w, r)
 	case "/api/export":
@@ -595,6 +611,68 @@ func (s *Server) handleUploadPath(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, uploadResponse{Method: res.Method, RsyncBinary: res.RsyncBinary, RsyncOutput: res.RsyncOutput, Results: res.Results})
 }
+func (s *Server) handleLargeImportStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	v, ok := s.currentVault(w)
+	if !ok {
+		return
+	}
+	var req largeImportRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.SourcePath) == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "sourcePath is required"})
+		return
+	}
+	job, err := importer.Start(context.Background(), v, req.SourcePath, importer.Options{VirtualPath: req.VirtualPath, Method: req.Method, RsyncBinary: req.RsyncBinary, DryRun: req.DryRun, SkipExisting: req.SkipExisting})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job.Progress())
+}
+
+func (s *Server) handleLargeImportStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "id is required"})
+		return
+	}
+	job, ok := importer.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, apiError{Error: "large import job not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, job.Progress())
+}
+
+func (s *Server) handleLargeImportCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "id is required"})
+		return
+	}
+	job, ok := importer.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, apiError{Error: "large import job not found"})
+		return
+	}
+	job.Cancel()
+	writeJSON(w, http.StatusOK, job.Progress())
+}
+
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		methodNotAllowed(w)
@@ -1743,11 +1821,17 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
       <input id="localRsyncBinary" value="{{.RsyncHint}}" placeholder="{{.RsyncHint}}" autocomplete="off">
       <small>Used only for system-rsync. Managed rsync uses the app-managed runtime path.</small>
     </label>
+    <label>Large import options
+      <span class="checkline"><input id="largeDryRun" type="checkbox"> Dry-run scan only</span>
+      <span class="checkline"><input id="largeSkipExisting" type="checkbox" checked> Skip existing matching files</span>
+      <small>Use Start large local import for multi-GB or TB folders. The browser only starts and monitors a backend job; it does not upload the folder.</small>
+    </label>
   </div>
   <p class="row-actions">
     <button class="operation" onclick="uploadFiles('fileInput', false)">Upload selected files</button>
     <button class="operation" onclick="uploadFiles('folderInput', true)">Upload selected browser folder</button>
     <button class="operation" onclick="uploadLocalPath()">Import local path</button>
+    <button class="operation" onclick="startLargeImport()">Start large local import</button>
     <button class="secondary" onclick="checkRsync()">Check rsync</button>
     <button class="danger" onclick="cancelActive()">Cancel active upload/export</button>
   </p>
@@ -2243,6 +2327,37 @@ async function uploadLocalPath(){
     showHuman('Local path import complete', res, 'success');
     await refreshFiles();
   } catch(e){ if(e.name === 'AbortError') showError('Upload cancelled', 'The local path ingest was cancelled.'); else showError('Local path import failed', e.message + '\n\nIf you selected a folder with the browser picker, use Upload selected browser folder. The browser cannot provide a real local disk path to the rsync import field.'); activeController=null; setBusy(false); }
+}
+let largeImportJobId = '';
+async function startLargeImport(){
+  try {
+    const sourcePath = requireLocalSourcePath();
+    if(!sourcePath) return;
+    const req = {sourcePath:sourcePath, virtualPath:$('uploadPath').value, method:$('localPutMethod').value || 'native', rsyncBinary:$('localRsyncBinary').value, dryRun:$('largeDryRun').checked, skipExisting:$('largeSkipExisting').checked};
+    const res = await api('/api/import-large/start',{method:'POST',headers:jsonHeaders,body:JSON.stringify(req)});
+    largeImportJobId = res.jobId;
+    beginOperation((req.dryRun?'Scanning':'Importing') + ' large local path...');
+    showHuman('Large import started', res, 'success');
+    pollLargeImport();
+  } catch(e){ showError('Could not start large import', e.message); }
+}
+async function pollLargeImport(){
+  if(!largeImportJobId) return;
+  try {
+    const res = await api('/api/import-large/status?id=' + encodeURIComponent(largeImportJobId));
+    const done = ['completed','completed-with-errors','failed','cancelled'].indexOf(res.status) >= 0;
+    const scanned = res.bytesScanned || 0;
+    const imported = res.bytesImported || 0;
+    setProgress(done ? 1 : imported, done ? 1 : Math.max(imported, scanned, 1), 'Status: ' + res.status + '. Files scanned: ' + (res.filesScanned||0) + ', imported: ' + (res.filesImported||0) + ', skipped: ' + (res.filesSkipped||0) + '. Current: ' + (res.currentPath || ''));
+    showHuman('Large import status', res, done && res.status==='completed' ? 'success' : (res.status==='failed' ? 'error' : ''));
+    if(done){ largeImportJobId=''; activeController=null; setBusy(false); await refreshFiles(); return; }
+    setTimeout(pollLargeImport, 1500);
+  } catch(e){ showError('Could not poll large import', e.message); largeImportJobId=''; activeController=null; setBusy(false); }
+}
+async function cancelLargeImport(){
+  if(!largeImportJobId) return false;
+  try { const res = await api('/api/import-large/cancel?id=' + encodeURIComponent(largeImportJobId), {method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Large import cancellation requested', res); return true; }
+  catch(e){ showError('Could not cancel large import', e.message); return false; }
 }
 async function checkRsync(){ try { const raw=$('localRsyncBinary').value.trim(); const bin=encodeURIComponent(raw); const res=await api('/api/rsync/status?binary='+bin); const where = raw ? raw : 'managed rsync, then PATH search'; const msg = res.available ? 'Using ' + (res.binary || where) + '.\n' + (res.version || '') + '\nRecommended method: ' + (res.recommended || 'native') : 'Checked ' + where + '. ' + (res.error || 'rsync was not found; native import remains available.'); showHuman(res.available?'rsync is available':'rsync is not available', msg + '\n\n' + JSON.stringify(res, null, 2), res.available?'success':'error'); } catch(e){ showError('Could not check rsync', e.message); } }
 async function rsyncStatus(check){ try { const res=await api('/api/rsync/status?checkUpdate='+(check?'1':'0')); $('rsyncStatus').textContent=JSON.stringify(res,null,2); showHuman('Managed rsync status loaded', res, res.managed && res.managed.runtimeOk ? 'success' : ''); } catch(e){ showError('Could not load rsync status', e.message); } }
