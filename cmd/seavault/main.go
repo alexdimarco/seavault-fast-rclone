@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/example/seavault-fast/internal/importer"
 	"github.com/example/seavault-fast/internal/keychain"
 	"github.com/example/seavault-fast/internal/localdav"
 	"github.com/example/seavault-fast/internal/passphrase"
@@ -162,11 +163,14 @@ func cmdPut(args []string) error {
 	noKeychain := fs.Bool("no-keychain", false, "do not try the OS keychain")
 	method := fs.String("method", "auto", "put method: auto, native, managed-rsync, system-rsync, or rsync; auto prefers managed rsync, then system rsync, then native")
 	rsyncBinary := fs.String("rsync", "", "system rsync binary path or name; ignored by managed-rsync")
+	large := fs.Bool("large", false, "stream a large local file or folder through a bounded-memory import path")
+	dryRun := fs.Bool("dry-run", false, "scan and report what a large import would process without writing to the vault")
+	skipExisting := fs.Bool("skip-existing", true, "large import skips existing destination files with matching size")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 2 || fs.NArg() > 3 {
-		return fmt.Errorf("usage: seavault put [--no-keychain] [--method auto|native|managed-rsync|system-rsync|rsync] [--rsync PATH] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
+		return fmt.Errorf("usage: seavault put [--no-keychain] [--large] [--dry-run] [--method auto|native|managed-rsync|system-rsync|rsync] [--rsync PATH] VAULT_DIR_OR_PROFILE SOURCE_PATH [VIRTUAL_PATH]")
 	}
 	vaultPath, err := resolveVaultArg(fs.Arg(0))
 	if err != nil {
@@ -183,6 +187,15 @@ func cmdPut(args []string) error {
 	virtual := ""
 	if fs.NArg() == 3 {
 		virtual = fs.Arg(2)
+	}
+	if *large || *dryRun {
+		progress := importer.ImportPath(context.Background(), v, fs.Arg(1), importer.Options{VirtualPath: virtual, DryRun: *dryRun, Method: *method, RsyncBinary: *rsyncBinary, SkipExisting: *skipExisting}, nil)
+		data, _ := json.MarshalIndent(progress, "", "  ")
+		fmt.Println(string(data))
+		if progress.Status == "failed" || progress.Status == "cancelled" {
+			return fmt.Errorf(progress.LastError)
+		}
+		return nil
 	}
 	res, err := rsyncput.PutPath(context.Background(), v, fs.Arg(1), virtual, rsyncput.Options{Method: *method, RsyncBinary: *rsyncBinary})
 	if err != nil {
