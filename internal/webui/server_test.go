@@ -12,7 +12,21 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/example/seavault-fast/internal/appconfig"
 )
+
+func TestMain(m *testing.M) {
+	appHome, err := os.MkdirTemp("", "seavault-webui-test-home-")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv("SEAVAULT_APP_HOME", appHome)
+	code := m.Run()
+	_ = os.RemoveAll(appHome)
+	os.Exit(code)
+}
 
 func postJSON(t *testing.T, s *Server, path string, payload any) *httptest.ResponseRecorder {
 	t.Helper()
@@ -627,5 +641,62 @@ func TestIntegratedWebDAVSecurityControls(t *testing.T) {
 	s.ServeHTTP(closedRR, closedReq)
 	if closedRR.Code != http.StatusConflict {
 		t.Fatalf("expected WebDAV stopped when vault closes, got %d", closedRR.Code)
+	}
+}
+
+func TestGuiAuthShowsLoginLandingAndProtectsAPI(t *testing.T) {
+	s, err := NewWithConfig("", appconfig.Config{Version: appconfig.Version, GUI: appconfig.GUIConfig{Protocol: "http", Username: "alex", PasswordConfigured: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("login landing failed: %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "SeaVault login") {
+		t.Fatalf("expected login landing page, got %q", rr.Body.String())
+	}
+
+	apiReq := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	apiRR := httptest.NewRecorder()
+	s.ServeHTTP(apiRR, apiReq)
+	if apiRR.Code != http.StatusUnauthorized {
+		t.Fatalf("expected protected API to return 401, got %d %s", apiRR.Code, apiRR.Body.String())
+	}
+}
+
+func TestGuiAuthSessionAllowsIndexAndLogoutClearsSession(t *testing.T) {
+	s, err := NewWithConfig("", appconfig.Config{Version: appconfig.Version, GUI: appconfig.GUIConfig{Protocol: "http", Username: "alex", PasswordConfigured: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := "test-session"
+	s.authSessions[session] = time.Now().Add(time.Hour)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: guiSessionCookie, Value: session})
+	rr := httptest.NewRecorder()
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("authenticated index failed: %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "Logout") {
+		t.Fatalf("expected logout link in authenticated UI")
+	}
+
+	logoutReq := httptest.NewRequest(http.MethodGet, "/logout", nil)
+	logoutReq.AddCookie(&http.Cookie{Name: guiSessionCookie, Value: session})
+	logoutRR := httptest.NewRecorder()
+	s.ServeHTTP(logoutRR, logoutReq)
+	if logoutRR.Code != http.StatusOK {
+		t.Fatalf("logout failed: %d", logoutRR.Code)
+	}
+	if _, ok := s.authSessions[session]; ok {
+		t.Fatalf("logout did not remove server-side session")
+	}
+	if got := logoutRR.Header().Get("Clear-Site-Data"); got == "" {
+		t.Fatalf("logout should ask the browser to clear local site data")
 	}
 }
