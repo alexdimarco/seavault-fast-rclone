@@ -42,7 +42,6 @@ type Server struct {
 	vault          *vault.Vault
 	token          string
 	webdavReadOnly bool
-	keychainStatus keychain.Status
 }
 
 type apiError struct {
@@ -145,7 +144,6 @@ type statusResponse struct {
 	Profiles        []profile.Entry  `json:"profiles"`
 	AvailableVaults []vaultStatusDTO `json:"availableVaults"`
 	SuggestedPaths  []string         `json:"suggestedPaths"`
-	KeychainStatus  keychain.Status  `json:"keychainStatus"`
 }
 
 type webdavStatusDTO struct {
@@ -160,33 +158,18 @@ type webdavRequest struct {
 }
 
 type vaultStatusDTO struct {
-	Name           string  `json:"name"`
-	VaultPath      string  `json:"vaultPath"`
-	VaultID        string  `json:"vaultId,omitempty"`
-	Exists         bool    `json:"exists"`
-	Open           bool    `json:"open"`
-	Keychain       bool    `json:"keychain"`
-	KeychainStatus string  `json:"keychainStatus,omitempty"`
-	KeychainError  string  `json:"keychainError,omitempty"`
-	Status         string  `json:"status"`
-	Error          string  `json:"error,omitempty"`
-	Files          int     `json:"files,omitempty"`
-	Objects        int     `json:"objects,omitempty"`
-	Referenced     int     `json:"referenced,omitempty"`
-	ReferencedMB   float64 `json:"referencedMB,omitempty"`
-}
-
-type profileStatusDTO struct {
-	Name           string `json:"name"`
-	VaultPath      string `json:"vaultPath"`
-	VaultID        string `json:"vaultId,omitempty"`
-	Exists         bool   `json:"exists"`
-	Open           bool   `json:"open"`
-	Keychain       bool   `json:"keychain"`
-	KeychainStatus string `json:"keychainStatus,omitempty"`
-	KeychainError  string `json:"keychainError,omitempty"`
-	Status         string `json:"status"`
-	Error          string `json:"error,omitempty"`
+	Name         string  `json:"name"`
+	VaultPath    string  `json:"vaultPath"`
+	VaultID      string  `json:"vaultId,omitempty"`
+	Exists       bool    `json:"exists"`
+	Open         bool    `json:"open"`
+	Keychain     bool    `json:"keychain"`
+	Status       string  `json:"status"`
+	Error        string  `json:"error,omitempty"`
+	Files        int     `json:"files,omitempty"`
+	Objects      int     `json:"objects,omitempty"`
+	Referenced   int     `json:"referenced,omitempty"`
+	ReferencedMB float64 `json:"referencedMB,omitempty"`
 }
 
 type vaultConfigDTO struct {
@@ -234,7 +217,7 @@ func New(initialVault string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{token: token, keychainStatus: keychain.Check()}
+	s := &Server{token: token}
 	if strings.TrimSpace(initialVault) != "" {
 		resolved, err := resolveVaultArg(initialVault)
 		if err != nil {
@@ -358,7 +341,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		cfgDTO = &vaultConfigDTO{Version: cfg.Version, KDF: cfg.KDF, Crypto: cfg.Crypto, Chunk: cfg.Chunk, CreatedAt: cfg.CreatedAt, ManifestMode: cfg.Crypto.ManifestMode}
 	}
 	s.mu.Unlock()
-	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths(), KeychainStatus: s.keychainStatus}
+	resp := statusResponse{Open: open, BrowserToken: s.tokenValue(), WebDAV: s.webdavStatus(), VaultPath: vaultPath, VaultID: vaultID, Config: cfgDTO, Profiles: entries, AvailableVaults: s.availableVaultStatuses(entries), SuggestedPaths: userpath.SuggestedVaultPaths()}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -441,13 +424,9 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, apiError{Error: cfgErr.Error()})
 			return
 		}
-		if !s.keychainStatus.Available {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: keychainUnavailableMessage(s.keychainStatus)})
-			return
-		}
 		p, err := keychain.Get(cfg.VaultID)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: "No saved keychain password was found for this vault. Enter the password manually, or use Open and save keychain after keychain access is available."})
+			writeJSON(w, http.StatusBadRequest, apiError{Error: err.Error()})
 			return
 		}
 		password = p
@@ -890,7 +869,7 @@ func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"profiles": s.profileStatuses(entries)})
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": entries})
 }
 
 func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
@@ -1344,14 +1323,8 @@ func (s *Server) availableVaultStatuses(entries []profile.Entry) []vaultStatusDT
 		}
 		st.VaultID = cfg.VaultID
 		if cfg.VaultID != "" {
-			if !s.keychainStatus.Available {
-				st.KeychainStatus = "unavailable"
-				st.KeychainError = s.keychainStatus.Detail
-			} else if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
+			if p, err := keychain.Get(cfg.VaultID); err == nil && p != "" {
 				st.Keychain = true
-				st.KeychainStatus = "active"
-			} else {
-				st.KeychainStatus = "not saved"
 			}
 		}
 		if st.Open {
@@ -1370,15 +1343,6 @@ func (s *Server) availableVaultStatuses(entries []profile.Entry) []vaultStatusDT
 		out = append(out, st)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
-func (s *Server) profileStatuses(entries []profile.Entry) []profileStatusDTO {
-	vaults := s.availableVaultStatuses(entries)
-	out := make([]profileStatusDTO, 0, len(vaults))
-	for _, v := range vaults {
-		out = append(out, profileStatusDTO{Name: v.Name, VaultPath: v.VaultPath, VaultID: v.VaultID, Exists: v.Exists, Open: v.Open, Keychain: v.Keychain, KeychainStatus: v.KeychainStatus, KeychainError: v.KeychainError, Status: v.Status, Error: v.Error})
-	}
 	return out
 }
 
@@ -1452,24 +1416,6 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
-}
-
-func keychainUnavailableMessage(st keychain.Status) string {
-	msg := st.Summary
-	if msg == "" {
-		msg = "OS keychain unavailable"
-	}
-	if st.Backend != "" {
-		msg += " (" + st.Backend + ")"
-	}
-	if st.Detail != "" {
-		msg += ": " + st.Detail
-	}
-	if len(st.Missing) > 0 {
-		msg += " Missing: " + strings.Join(st.Missing, ", ") + "."
-	}
-	msg += " Enter the vault password manually, or set SEAVAULT_PASSWORD before launching SeaVault."
-	return msg
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1592,8 +1538,6 @@ progress { width: 100%; height: 18px; accent-color: var(--focus); }
 table { width: 100%; border-collapse: collapse; min-width: 680px; }
 th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .table-wrap { overflow-x: auto; width: 100%; -webkit-overflow-scrolling: touch; }
-.raw-file-list.scroll-y { max-height: 760px; overflow: auto; border: 1px solid var(--border); border-radius: 12px; }
-.raw-file-list.scroll-y table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
 .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; word-break: break-word; }
 .row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .checkline { display: inline-flex; gap: 8px; align-items: center; width: auto; }
@@ -1606,9 +1550,6 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
 .vault-card progress { height: 10px; margin-top: 8px; }
 .status-open { border-color: var(--success); background: color-mix(in srgb, var(--success-bg) 60%, var(--panel-2)); }
 .status-error, .status-missing { border-color: var(--danger); background: color-mix(in srgb, var(--danger-bg) 55%, var(--panel-2)); }
-.status-warning { border-color: var(--button-border); background: color-mix(in srgb, var(--button) 70%, var(--panel-2)); }
-.dependency-status { margin: 10px 0 14px; }
-.dependency-status small { display: block; margin-top: 4px; }
 .jump-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .jump-links a { color: var(--focus); text-decoration: none; padding: 4px 0; }
 .jump-links a:hover { text-decoration: underline; }
@@ -1964,8 +1905,6 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border);
   <progress id="progress" value="0" max="1"></progress>
   <p id="progressText"><small>No active operation.</small></p>
   <p class="row-actions"><button class="danger" onclick="cancelActive()">Cancel active operation</button><button class="secondary" onclick="clearOutput()">Clear</button><button class="secondary" onclick="refreshStatus()">Refresh vaults</button></p>
-  <h3>Local dependencies</h3>
-  <div id="keychainStatusBox" class="dependency-status"><p class="hint">Dependency status will appear after refresh.</p></div>
   <h3>WebDAV file manager</h3>
   <div id="webdavStatusBox"><p class="hint">WebDAV status will appear after refresh.</p></div>
   <h3>Available saved vaults</h3>
@@ -2087,16 +2026,6 @@ function renderVaultSelector(status){
     moveSel.innerHTML = '<option value="">Use active/manual source path</option>' + rows.map(v => '<option value="'+esc(v.name)+'" data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'"'+(currentMove===v.name?' selected':'')+'>'+esc(v.name)+' - '+esc(v.status)+'</option>').join('');
   }
 }
-function renderKeychainStatus(status){
-  const box = $('keychainStatusBox');
-  if(!box) return;
-  const st = (status && status.keychainStatus) || {};
-  const cls = st.available ? 'status-open' : (st.summary && st.summary.indexOf('may be unavailable') >= 0 ? 'status-warning' : 'status-missing');
-  const missing = (st.missing || []).length ? '<small>Missing or unavailable: '+esc((st.missing || []).join(', '))+'</small>' : '';
-  const detail = st.detail ? '<small>'+esc(st.detail)+'</small>' : '';
-  box.innerHTML = '<div class="vault-card '+cls+'"><header><span class="vault-name">OS keychain</span><span class="pill">'+esc(st.available ? 'available' : 'unavailable')+'</span></header><small>Backend: '+esc(st.backend || 'unknown')+'</small>'+detail+missing+'</div>';
-}
-function keychainUnavailable(status){ return status && status.keychainStatus && !status.keychainStatus.available; }
 function renderAvailableVaults(status){
   const box = $('availableVaults');
   if(!box) return;
@@ -2105,13 +2034,10 @@ function renderAvailableVaults(status){
   box.innerHTML = rows.map(v => {
     const cls = v.open ? 'status-open' : (v.status === 'missing' ? 'status-missing' : (v.status === 'error' ? 'status-error' : ''));
     const pct = v.open ? 1 : (v.exists ? 0.55 : 0.15);
-    const key = v.keychain ? 'keychain saved' : (v.keychainStatus === 'unavailable' ? 'keychain unavailable' : 'password required');
+    const key = v.keychain ? 'keychain saved' : 'password required';
     const stats = v.open && v.files !== undefined ? '<br><small>'+Number(v.files||0)+' file(s), '+Number(v.objects||0)+' object(s), '+Number(v.referencedMB||0).toFixed(2)+' MiB referenced</small>' : '';
-    const err = v.error ? '<br><small>'+esc(v.error)+'</small>' : (v.keychainError ? '<br><small>'+esc(v.keychainError)+'</small>' : '');
-    const passwordId = 'vault-card-password-' + slug(v.name || v.vaultPath);
-    const keyIndicator = v.keychain ? '<span class="pill">keychain active</span>' : (v.keychainStatus === 'unavailable' ? '<span class="pill">keychain unavailable</span>' : '<span class="pill">no keychain password</span>');
-    const openLabel = v.keychainStatus === 'unavailable' ? 'Open with password' : 'Open';
-    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><label>Password <input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="optional; blank uses keychain when active"></label><p class="row-actions">'+keyIndicator+'<button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">'+openLabel+'</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button></p></article>';
+    const err = v.error ? '<br><small>'+esc(v.error)+'</small>' : '';
+    return '<article class="vault-card '+cls+'"><header><span class="vault-name">'+esc(v.name)+'</span><span class="pill">'+esc(v.status)+'</span></header><div class="vault-path">'+esc(v.vaultPath)+'</div><small>'+key+(v.open?' | active vault':'')+'</small>'+stats+err+'<progress value="'+pct+'" max="1"></progress><p class="row-actions"><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="openSavedVault(this.dataset.name,this.dataset.path,true)">Open</button><button data-name="'+esc(v.name)+'" data-path="'+esc(v.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button></p></article>';
   }).join('');
 }
 function selectVaultCard(name, path){ $('vaultPath').value = path; $('profile').value = name; const sel=$('vaultSelect'); if(sel) sel.value=name; showHuman('Saved vault selected', 'Selected ' + name + '.'); }
@@ -2120,19 +2046,10 @@ async function openSavedVault(name, path, useKeychain){
   $('profile').value = name || '';
   await openVault(useKeychain);
 }
-function slug(s){ return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '_'); }
-async function openSavedVaultFromPassword(name, path, passwordId, saveKeychain){
-  const pw = passwordId && $(passwordId) ? $(passwordId).value : '';
-  $('vaultPath').value = name || path;
-  $('profile').value = name || '';
-  $('password').value = pw;
-  $('savePassword').checked = !!saveKeychain;
-  await openVault(!pw);
-}
 function initPayload(){ return {vaultPath:$('vaultPath').value, password:$('password').value, profile:$('profile').value, savePassword:$('savePassword').checked, kdf:$('kdf').value}; }
 function openPayload(useKeychain){ return {vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked, useKeychain:useKeychain}; }
 function localPathWarning(){ const p = $('vaultPath').value.trim(); if(p === '/user' || p.indexOf('/user/') === 0) return 'The path starts with /user. Use ~/Nextcloud/seavault, /Users/<name>/... on macOS, or /home/<name>/... on Linux.'; return ''; }
-async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderKeychainStatus(s); renderWebDAVStatus(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
+async function refreshStatus(){ try { const s = await api('/api/status'); if(s.browserToken) updateSessionToken(s.browserToken); lastStatus = s; renderVaultSelector(s); renderAvailableVaults(s); renderWebDAVStatus(s); showHuman('Status refreshed', s); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not refresh status', e.message); } }
 async function saveCurrentVaultProfile(){
   try {
     const req = {name:$('profile').value, vaultPath:$('vaultPath').value, password:$('password').value, savePassword:$('savePassword').checked};
@@ -2144,8 +2061,8 @@ async function saveCurrentVaultProfile(){
     await refreshStatus();
   } catch(e){ showError('Could not save vault', e.message); }
 }
-async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderWebDAVStatus(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
-async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderKeychainStatus(status); renderWebDAVStatus(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
+async function initVault(){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/init',{method:'POST',headers:jsonHeaders,body:JSON.stringify(initPayload())}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderWebDAVStatus(status); showHuman('Vault created and opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not create vault', e.message); } }
+async function openVault(useKeychain){ try { const warn = localPathWarning(); if(warn){ showError('Invalid vault path', warn); return; } const res = await api('/api/open',{method:'POST',headers:jsonHeaders,body:JSON.stringify(openPayload(useKeychain))}); $('password').value=''; const status = await api('/api/status'); status.lastAction = res; lastStatus = status; renderVaultSelector(status); renderAvailableVaults(status); renderWebDAVStatus(status); showHuman('Vault opened', status, 'success'); await refreshFiles(); await refreshDavFiles(); await loadProfiles(); } catch(e){ showError('Could not open vault', e.message); } }
 async function closeVault(){ try { const res = await api('/api/close',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault closed', res, 'success'); await refreshStatus(); } catch(e){ showError('Could not close vault', e.message); } }
 function fileSizeTotal(files){ return Array.from(files || []).reduce((n,f)=>n+(f.size||0),0); }
 function commonFolderRoot(files){
@@ -2464,15 +2381,13 @@ function renderWebDAVStatus(status){
   box.innerHTML = '<div class="vault-card '+(wd.running?'status-open':'status-missing')+'"><header><span class="vault-name">WebDAV</span><span class="pill">'+(wd.running?'running':'stopped')+'</span></header><small>Mode: '+(wd.readOnly?'read-only':'read/write')+'<br>Current path: '+esc(currentDavPath||'vault root')+'<br>Selected: '+esc(selected)+'</small><div class="vault-path">'+esc(wd.url||'Open a vault to start WebDAV')+'</div><progress value="'+(wd.running?1:0.15)+'" max="1"></progress></div>';
 }
 async function refreshFiles(){
-  const box = $('files');
   try {
     const data = await api('/api/files');
     const rows = data.files || [];
-    box.className = 'table-wrap raw-file-list' + (rows.length > 10 ? ' scroll-y' : '');
-    if(rows.length === 0){ box.innerHTML = '<p>No files in the open vault.</p>'; return; }
-    box.innerHTML = '<table><thead><tr><th>Path</th><th>Size</th><th>Chunks</th><th>Updated</th><th>Actions</th></tr></thead><tbody>' +
+    if(rows.length === 0){ $('files').innerHTML = '<p>No files in the open vault.</p>'; return; }
+    $('files').innerHTML = '<table><thead><tr><th>Path</th><th>Size</th><th>Chunks</th><th>Updated</th><th>Actions</th></tr></thead><tbody>' +
       rows.map(f => '<tr><td class="path">'+esc(f.path)+(f.conflictOf?' <small>conflict of '+esc(f.conflictOf)+'</small>':'')+'</td><td>'+fmtBytes(f.size)+'</td><td>'+f.chunks+'</td><td>'+esc(f.updatedAt||'')+'</td><td class="row-actions"><button onclick="downloadFile(\''+encodeURIComponent(f.path)+'\')">Download</button><button data-export-path="'+encodeURIComponent(dirname(f.path))+'" onclick="setExportPath(decodeURIComponent(this.dataset.exportPath))">Use folder</button><button class="danger" onclick="deleteFile(\''+encodeURIComponent(f.path)+'\')">Delete</button></td></tr>').join('') + '</tbody></table>';
-  } catch(e){ box.className = 'table-wrap raw-file-list'; box.innerHTML = '<p>'+esc(e.message)+'</p>'; }
+  } catch(e){ $('files').innerHTML = '<p>'+esc(e.message)+'</p>'; }
 }
 function dirname(p){ const i=String(p).lastIndexOf('/'); return i>0?String(p).slice(0,i):'.'; }
 function setExportPath(p){ $('exportPath').value = p || '.'; showHuman('Export path selected', 'Selected export path: ' + (p || '.')); }
@@ -2481,17 +2396,7 @@ async function deleteFile(p){ try { await api('/api/file?path='+p,{method:'DELET
 async function verifyVault(){ try { const res = await api('/api/verify',{method:'POST',headers:jsonHeaders,body:'{}'}); showHuman('Vault verification passed', res, 'success'); } catch(e){ showError('Vault verification failed', e.message); } }
 async function loadStats(){ try { const res = await api('/api/stats'); showHuman('Vault statistics', res); } catch(e){ showError('Could not load stats', e.message); } }
 async function loadProfiles(){
-  try {
-    const data = await api('/api/profiles');
-    const rows = data.profiles || [];
-    $('profiles').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Vault path</th><th>Keychain</th><th>Password</th><th>Actions</th></tr></thead><tbody>'+rows.map(p=>{
-      const passwordId = 'profile-password-' + slug(p.name || p.vaultPath);
-      const keychain = p.keychain ? '<span class="pill">active</span>' : (p.keychainStatus === 'unavailable' ? '<span class="pill">unavailable</span>' : '<span class="pill">not saved</span>');
-      const status = p.status ? '<br><small>'+esc(p.status)+(p.open?' | active vault':'')+'</small>' : '';
-      const err = p.error ? '<br><small>'+esc(p.error)+'</small>' : (p.keychainError ? '<br><small>'+esc(p.keychainError)+'</small>' : '');
-      return '<tr><td>'+esc(p.name)+status+err+'</td><td class="path">'+esc(p.vaultPath)+'</td><td>'+keychain+'</td><td><input id="'+passwordId+'" type="password" autocomplete="current-password" placeholder="enter password"></td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,false)">Open</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" data-password-id="'+passwordId+'" onclick="openSavedVaultFromPassword(this.dataset.name,this.dataset.path,this.dataset.passwordId,true)">Open and save keychain</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectMoveProfile(this.dataset.name,this.dataset.path)">Move</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>';
-    }).join('')+'</tbody></table>' : '<p>No saved vault locations.</p>';
-  }
+  try { const data = await api('/api/profiles'); const rows = data.profiles || []; $('profiles').innerHTML = rows.length ? '<table><thead><tr><th>Name</th><th>Vault path</th><th>Actions</th></tr></thead><tbody>'+rows.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="path">'+esc(p.vaultPath)+'</td><td class="row-actions"><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectVaultCard(this.dataset.name,this.dataset.path)">Select</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="openSavedVault(this.dataset.name,this.dataset.path,true)">Open with keychain</button><button data-name="'+esc(p.name)+'" data-path="'+esc(p.vaultPath)+'" onclick="selectMoveProfile(this.dataset.name,this.dataset.path)">Move</button><button class="danger" data-name="'+esc(p.name)+'" onclick="deleteProfile(this.dataset.name)">Remove</button></td></tr>').join('')+'</tbody></table>' : '<p>No saved vault locations.</p>'; }
   catch(e){ $('profiles').innerHTML = '<p>'+esc(e.message)+'</p>'; }
 }
 function selectMoveProfile(name,path){ $('moveProfile').value=name; $('moveSource').value=path; $('moveDest').value=''; showHuman('Move source selected', 'Selected saved vault ' + name + '. Enter the new vault location, then click Move vault location.'); location.hash='move-panel'; }

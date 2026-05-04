@@ -1,0 +1,268 @@
+diff -ruN single_instance_orig/seavault-fast-rclone/cmd/seavault/main.go single_instance_work/seavault-fast-rclone/cmd/seavault/main.go
+--- single_instance_orig/seavault-fast-rclone/cmd/seavault/main.go	2026-05-04 00:49:38.000000000 +0000
++++ single_instance_work/seavault-fast-rclone/cmd/seavault/main.go	2026-05-04 12:22:21.530126973 +0000
+@@ -16,6 +16,7 @@
+ 	"github.com/example/seavault-fast/internal/keychain"
+ 	"github.com/example/seavault-fast/internal/localdav"
+ 	"github.com/example/seavault-fast/internal/passphrase"
++	"github.com/example/seavault-fast/internal/processguard"
+ 	"github.com/example/seavault-fast/internal/profile"
+ 	"github.com/example/seavault-fast/internal/rclonebin"
+ 	"github.com/example/seavault-fast/internal/remotes"
+@@ -450,6 +451,9 @@
+ 	if fs.NArg() == 1 {
+ 		initial = fs.Arg(0)
+ 	}
++	if err := processguard.TerminateExistingSeaVaultProcesses(); err != nil {
++		return err
++	}
+ 	s, err := webui.New(initial)
+ 	if err != nil {
+ 		return err
+diff -ruN single_instance_orig/seavault-fast-rclone/internal/processguard/processguard.go single_instance_work/seavault-fast-rclone/internal/processguard/processguard.go
+--- single_instance_orig/seavault-fast-rclone/internal/processguard/processguard.go	1970-01-01 00:00:00.000000000 +0000
++++ single_instance_work/seavault-fast-rclone/internal/processguard/processguard.go	2026-05-04 12:22:39.305299289 +0000
+@@ -0,0 +1,100 @@
++package processguard
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++)
++
++// TerminateExistingSeaVaultProcesses stops already-running SeaVault GUI/process
++// instances before a new GUI instance starts. It never terminates the current
++// process.
++func TerminateExistingSeaVaultProcesses() error {
++	selfPID := os.Getpid()
++	selfExe := executableName()
++
++	procs, err := listProcesses()
++	if err != nil {
++		return err
++	}
++
++	var failures []string
++	for _, p := range procs {
++		if p.PID <= 0 || p.PID == selfPID {
++			continue
++		}
++		if !isSeaVaultProcess(p, selfExe) {
++			continue
++		}
++		if err := terminateProcess(p.PID); err != nil {
++			failures = append(failures, fmt.Sprintf("pid %d: %v", p.PID, err))
++		}
++	}
++	if len(failures) > 0 {
++		return fmt.Errorf("failed to terminate existing SeaVault process(es): %s", strings.Join(failures, "; "))
++	}
++	return nil
++}
++
++type processInfo struct {
++	PID  int
++	Name string
++	Args string
++}
++
++func executableName() string {
++	exe, err := os.Executable()
++	if err != nil {
++		return "seavault"
++	}
++	name := filepath.Base(exe)
++	return strings.ToLower(strings.TrimSuffix(name, ".exe"))
++}
++
++func isSeaVaultProcess(p processInfo, selfExe string) bool {
++	name := normalizeProcessName(p.Name)
++	if name == "seavault" || name == selfExe {
++		return true
++	}
++	firstArg := firstCommandToken(p.Args)
++	if firstArg == "" {
++		return false
++	}
++	base := normalizeProcessName(firstArg)
++	return base == "seavault" || base == selfExe
++}
++
++func normalizeProcessName(name string) string {
++	name = strings.TrimSpace(strings.Trim(name, `"'`))
++	name = strings.ReplaceAll(name, "\\", "/")
++	name = filepath.Base(name)
++	name = strings.TrimSuffix(strings.ToLower(name), ".exe")
++	return name
++}
++
++func firstCommandToken(args string) string {
++	args = strings.TrimSpace(args)
++	if args == "" {
++		return ""
++	}
++	if args[0] == '"' {
++		if end := strings.Index(args[1:], "\""); end >= 0 {
++			return args[1 : end+1]
++		}
++	}
++	fields := strings.Fields(args)
++	if len(fields) == 0 {
++		return ""
++	}
++	return fields[0]
++}
++
++func atoiPID(s string) int {
++	pid, err := strconv.Atoi(strings.TrimSpace(s))
++	if err != nil {
++		return 0
++	}
++	return pid
++}
+diff -ruN single_instance_orig/seavault-fast-rclone/internal/processguard/processguard_test.go single_instance_work/seavault-fast-rclone/internal/processguard/processguard_test.go
+--- single_instance_orig/seavault-fast-rclone/internal/processguard/processguard_test.go	1970-01-01 00:00:00.000000000 +0000
++++ single_instance_work/seavault-fast-rclone/internal/processguard/processguard_test.go	2026-05-04 12:22:21.527013395 +0000
+@@ -0,0 +1,38 @@
++package processguard
++
++import "testing"
++
++func TestIsSeaVaultProcessMatchesNameAndArgs(t *testing.T) {
++	tests := []struct {
++		name string
++		proc processInfo
++		want bool
++	}{
++		{name: "exact unix name", proc: processInfo{PID: 10, Name: "seavault"}, want: true},
++		{name: "windows exe name", proc: processInfo{PID: 11, Name: "SeaVault.exe"}, want: true},
++		{name: "path in args", proc: processInfo{PID: 12, Name: "launcher", Args: "/opt/seavault/seavault gui"}, want: true},
++		{name: "quoted path in args", proc: processInfo{PID: 13, Name: "launcher", Args: "\"C:\\Program Files\\SeaVault\\seavault.exe\" gui"}, want: true},
++		{name: "non match", proc: processInfo{PID: 14, Name: "rclone", Args: "rclone serve"}, want: false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := isSeaVaultProcess(tt.proc, "seavault"); got != tt.want {
++				t.Fatalf("isSeaVaultProcess() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestFirstCommandToken(t *testing.T) {
++	tests := map[string]string{
++		"/usr/local/bin/seavault gui":                       "/usr/local/bin/seavault",
++		"  seavault gui --no-open":                          "seavault",
++		"\"C:\\Program Files\\SeaVault\\seavault.exe\" gui": "C:\\Program Files\\SeaVault\\seavault.exe",
++		"": "",
++	}
++	for input, want := range tests {
++		if got := firstCommandToken(input); got != want {
++			t.Fatalf("firstCommandToken(%q) = %q, want %q", input, got, want)
++		}
++	}
++}
+diff -ruN single_instance_orig/seavault-fast-rclone/internal/processguard/processguard_unix.go single_instance_work/seavault-fast-rclone/internal/processguard/processguard_unix.go
+--- single_instance_orig/seavault-fast-rclone/internal/processguard/processguard_unix.go	1970-01-01 00:00:00.000000000 +0000
++++ single_instance_work/seavault-fast-rclone/internal/processguard/processguard_unix.go	2026-05-04 12:22:21.453540506 +0000
+@@ -0,0 +1,48 @@
++//go:build !windows
++
++package processguard
++
++import (
++	"bytes"
++	"fmt"
++	"os/exec"
++	"strconv"
++	"strings"
++)
++
++func listProcesses() ([]processInfo, error) {
++	out, err := exec.Command("ps", "-axo", "pid=,comm=,args=").Output()
++	if err != nil {
++		return nil, fmt.Errorf("list processes with ps: %w", err)
++	}
++	return parsePSOutput(out), nil
++}
++
++func terminateProcess(pid int) error {
++	return exec.Command("kill", strconv.Itoa(pid)).Run()
++}
++
++func parsePSOutput(out []byte) []processInfo {
++	var procs []processInfo
++	for _, line := range bytes.Split(out, []byte{'\n'}) {
++		text := strings.TrimSpace(string(line))
++		if text == "" {
++			continue
++		}
++		fields := strings.Fields(text)
++		if len(fields) < 2 {
++			continue
++		}
++		pid := atoiPID(fields[0])
++		if pid <= 0 {
++			continue
++		}
++		name := fields[1]
++		args := ""
++		if len(fields) > 2 {
++			args = strings.Join(fields[2:], " ")
++		}
++		procs = append(procs, processInfo{PID: pid, Name: name, Args: args})
++	}
++	return procs
++}
+diff -ruN single_instance_orig/seavault-fast-rclone/internal/processguard/processguard_windows.go single_instance_work/seavault-fast-rclone/internal/processguard/processguard_windows.go
+--- single_instance_orig/seavault-fast-rclone/internal/processguard/processguard_windows.go	1970-01-01 00:00:00.000000000 +0000
++++ single_instance_work/seavault-fast-rclone/internal/processguard/processguard_windows.go	2026-05-04 12:22:21.459585379 +0000
+@@ -0,0 +1,45 @@
++//go:build windows
++
++package processguard
++
++import (
++	"bytes"
++	"encoding/csv"
++	"fmt"
++	"os/exec"
++	"strconv"
++	"strings"
++)
++
++func listProcesses() ([]processInfo, error) {
++	out, err := exec.Command("tasklist", "/FO", "CSV", "/NH").Output()
++	if err != nil {
++		return nil, fmt.Errorf("list processes with tasklist: %w", err)
++	}
++	return parseTasklistCSV(out)
++}
++
++func terminateProcess(pid int) error {
++	return exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/T", "/F").Run()
++}
++
++func parseTasklistCSV(out []byte) ([]processInfo, error) {
++	r := csv.NewReader(bytes.NewReader(out))
++	r.FieldsPerRecord = -1
++	rows, err := r.ReadAll()
++	if err != nil {
++		return nil, fmt.Errorf("parse tasklist output: %w", err)
++	}
++	var procs []processInfo
++	for _, row := range rows {
++		if len(row) < 2 {
++			continue
++		}
++		pid := atoiPID(strings.TrimSpace(row[1]))
++		if pid <= 0 {
++			continue
++		}
++		procs = append(procs, processInfo{PID: pid, Name: row[0]})
++	}
++	return procs, nil
++}

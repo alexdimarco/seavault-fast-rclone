@@ -510,7 +510,7 @@ func TestIntegratedWebDAVFileManagerSmoke(t *testing.T) {
 		t.Fatalf("/files failed: %d", filesRR.Code)
 	}
 	html := filesRR.Body.String()
-	for _, want := range []string{"WebDAV file manager", "davPropfind", "PROPFIND", "Drop files here", "copyDavURL", "webdavStatusBox"} {
+	for _, want := range []string{"WebDAV file manager", "davPropfind", "PROPFIND", "Drop files here", "copyDavURL", "webdavStatusBox", "Select current folder"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("/files markup missing %q", want)
 		}
@@ -523,6 +523,18 @@ func TestIntegratedWebDAVFileManagerSmoke(t *testing.T) {
 	rr = davRequest(t, s, "MKCOL", "empty-folder", nil, nil)
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("MKCOL failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, "MKCOL", "content/explicit-empty", nil, nil)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("MKCOL under content failed: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, http.MethodDelete, "content", nil, nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected protected content delete rejection, got %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, "COPY", "", nil, map[string]string{"Destination": "/dav/" + s.token + "/root-copy"})
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected root COPY rejection, got %d %s", rr.Code, rr.Body.String())
 	}
 	rr = davRequest(t, s, "PROPFIND", "", nil, map[string]string{"Depth": "1"})
 	if rr.Code != 207 {
@@ -580,7 +592,11 @@ func TestIntegratedWebDAVSecurityControls(t *testing.T) {
 		t.Fatalf("expected token rejection, got %d", badRR.Code)
 	}
 
-	rr := davRequest(t, s, http.MethodPut, ".seavault/evil", bytes.NewReader([]byte("x")), nil)
+	rr := davRequest(t, s, http.MethodPut, ".SeAvAuLt/evil", bytes.NewReader([]byte("x")), nil)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected case-insensitive .seavault rejection, got %d %s", rr.Code, rr.Body.String())
+	}
+	rr = davRequest(t, s, http.MethodPut, ".seavault/evil", bytes.NewReader([]byte("x")), nil)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected .seavault rejection, got %d %s", rr.Code, rr.Body.String())
 	}

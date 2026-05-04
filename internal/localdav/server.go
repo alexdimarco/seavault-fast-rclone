@@ -210,7 +210,7 @@ func (s *Server) handleCopyMove(w http.ResponseWriter, r *http.Request, move boo
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if dst == "" || (move && src == "") {
+	if dst == "" || src == "" {
 		http.Error(w, "invalid source or destination", http.StatusBadRequest)
 		return
 	}

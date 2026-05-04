@@ -16,6 +16,7 @@ import (
 	"github.com/example/seavault-fast/internal/keychain"
 	"github.com/example/seavault-fast/internal/localdav"
 	"github.com/example/seavault-fast/internal/passphrase"
+	"github.com/example/seavault-fast/internal/processguard"
 	"github.com/example/seavault-fast/internal/profile"
 	"github.com/example/seavault-fast/internal/rclonebin"
 	"github.com/example/seavault-fast/internal/remotes"
@@ -449,6 +450,9 @@ func cmdGUI(args []string) error {
 	}
 	if fs.NArg() == 1 {
 		initial = fs.Arg(0)
+	}
+	if err := processguard.TerminateExistingSeaVaultProcesses(); err != nil {
+		return err
 	}
 	s, err := webui.New(initial)
 	if err != nil {

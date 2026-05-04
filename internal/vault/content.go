@@ -59,7 +59,7 @@ func normalizeContentDirPath(input string) (string, error) {
 
 func containsReservedSegment(vp string) bool {
 	for _, seg := range strings.Split(vp, "/") {
-		if seg == MetadataDirName || seg == DirectoryMarkerName {
+		if strings.EqualFold(seg, MetadataDirName) || strings.EqualFold(seg, DirectoryMarkerName) {
 			return true
 		}
 	}
@@ -68,7 +68,7 @@ func containsReservedSegment(vp string) bool {
 
 func IsDirectoryMarkerPath(vp string) bool {
 	vp = strings.Trim(vp, "/")
-	return vp == DirectoryMarkerName || strings.HasSuffix(vp, "/"+DirectoryMarkerName)
+	return strings.EqualFold(vp, DirectoryMarkerName) || strings.HasSuffix(strings.ToLower(vp), "/"+strings.ToLower(DirectoryMarkerName))
 }
 
 func IsInternalVirtualPath(vp string) bool {
